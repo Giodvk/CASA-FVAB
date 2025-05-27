@@ -222,7 +222,8 @@ def train(
         optimizer: torch.optim.Optimizer,
         scheduler: torch.optim.lr_scheduler._LRScheduler,
         device: torch.device,
-        epochs: int = 50
+        valid_N : int,
+        epochs: int = 50,
 ) -> Dict[str, List[float]]:
     best_acc = 0.0
     metrics = {"train_loss": [], "val_acc": []}
@@ -242,8 +243,9 @@ def train(
             loss.backward()
             optimizer.step()
 
-        val_acc = evaluate(model, val_loader, device)
+        val_acc = evaluate(model, val_loader, device, valid_N)
         scheduler.step(int(val_acc))
+        print(f"Epoch {epoch} accuracy : {val_acc:.4f}")
 
         metrics["train_loss"].append(loss.item())
         metrics["val_acc"].append(val_acc)
@@ -258,10 +260,22 @@ def train(
 def evaluate(
         model: torch.nn.Module,
         data_loader: torch.utils.data.DataLoader,
-        device: torch.device
+        device: torch.device,
+        valid_N: int
 ) -> float:
-   ...
+    model.eval()
+    accuracy = 0
+    with torch.no_grad():
+        for x, y in data_loader:
+            features = {k: v.to(device) for k, v in x.items()}
+            output = model(features["mel"].unsqueeze(1))
+            accuracy += get_batch_accuracy(output, y, valid_N)
+    return accuracy
 
+def get_batch_accuracy(output, y, N):
+    pred = output.argmax(dim=1, keepdim=True)
+    correct = pred.eq(y.view_as(pred)).sum().item()
+    return correct / N
 
 def main():
     parser = argparse.ArgumentParser()
@@ -269,8 +283,8 @@ def main():
     parser.add_argument("--test_speakers", nargs="+", required=True)
     parser.add_argument("--data_dir", type=Path, required=True)
     parser.add_argument("--batch_size", type=int, default=32)
-    parser.add_argument("--epochs", type=int, default=100)
-    args = parser.parse_args(['--train_speakers', "Barack Obama",'--test_speaker', "Donald Trump",
+    parser.add_argument("--epochs", type=int, default=10)
+    args = parser.parse_args(['--train_speakers', *train_speaker ,'--test_speaker', *test_speaker ,
                               "--data_dir", "./processed_audio/"])
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -305,6 +319,8 @@ def main():
         pin_memory=True
     )
 
+    len_valid = len(test_loader.dataset)
+
     # Training loop
     metrics = train(
         model,
@@ -313,6 +329,7 @@ def main():
         optimizer,
         scheduler,
         device,
+        len_valid,
         args.epochs
     )
 
