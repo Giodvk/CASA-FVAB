@@ -1,12 +1,19 @@
+import random
+
 import numpy as np
 import pandas as pd
 import librosa
+import soundfile
 import torch
 from sklearn.model_selection import train_test_split
 from torch.utils.data import Dataset
 from sklearn.cluster import KMeans
+from voicefixer import VoiceFixer
+import pytsmod as tsm
 
 DIR_PATH = './processed_audio/'
+voice_fixer = VoiceFixer() #Da usare solo con GPU
+
 
 class AudioBalancer:
     def __init__(self, reduction_threshold=0.4, augmentation_threshold=0.2,
@@ -56,24 +63,26 @@ class AudioBalancer:
 
         return pd.concat([spoof, bona_fide])
 
-    def _augmentation(self, speaker_df):
-        """"
-                # Data Augmentation per sbilanciamenti residui
-                if abs(imbalance) > self.augmentation_threshold:
-                    if len(spoof) < len(bona_fide):
-                        augment_class = spoof
-                        target_size = int(len(bona_fide) * self.augmentation_factor)
-                    else:
-                        augment_class = bona_fide
-                        target_size = int(len(spoof) * self.augmentation_factor)
+    def augmentation(self, speaker_df):
+        spoof = speaker_df[speaker_df['label'] == 0]
+        bona_fide = speaker_df[speaker_df['label'] == 1]
 
-                    augmented_samples = []
-                    while len(augmented_samples) < (target_size - len(augment_class)):
-                        sample = augment_class.sample(1).iloc[0]
-                        augmented_samples.append(self._augment_audio(sample))
+        # Calcola lo sbilanciamento
+        imbalance = (len(bona_fide) - len(spoof)) / (len(bona_fide) + 1e-8)
 
-                    return pd.concat([spoof, bona_fide, pd.DataFrame(augmented_samples)])
-                    """
+        # Data Augmentation per sbilanciamenti residui
+        if abs(imbalance) > self.augmentation_threshold:
+            if len(spoof) < len(bona_fide):
+                augment_class = spoof
+                target_size = int(len(bona_fide) * self.augmentation_factor)
+                print("Augmentation")
+                augmented_samples = []
+                while len(augmented_samples) < (target_size - len(augment_class)):
+                    sample = augment_class.sample(1).iloc[0]
+                    augmented_samples.append(self._augment_audio(sample))
+
+                return pd.concat([spoof, bona_fide, pd.DataFrame(augmented_samples)])
+
 
     def _extract_mfcc(self, row, path):
         """Estrae features MFCC da un file audio"""
@@ -82,13 +91,17 @@ class AudioBalancer:
 
     def _augment_audio(self, row):
         """Genera un sample aumentato"""
-        audio, sr = librosa.load(f"./release_in_the_wild/{row['file']}", sr=None)
-        augmented = self.augmenter(samples=audio, sample_rate=sr)
+        audio, sr = librosa.load(f"{DIR_PATH}{row['speaker']}/{row['file']}", sr=None)
+        print(audio.shape)
+        audioaug = voice_fixer.restore(np.ravel(audio), sr, mode=2, cuda=True)
+        audioaug = tsm.wsola(audioaug, 1.25)
+
+        soundfile.write(f"{DIR_PATH}{row['speaker']}/{row['file']}_augmented", audioaug, samplerate=sr)
+        print(soundfile)
         return {
-            'file': f"augmented_{row['file']}",
+            'file': f"{row['file']}_augmented",
             'speaker': row['speaker'],
-            'label': row['label'],
-            'audio': augmented
+            'label': row['label']
         }
 
     def balance_dataset(self, df, path):
@@ -116,7 +129,7 @@ class AudioDataset(Dataset):
         row = self.df.iloc[idx]
 
         if 'audio' not in row:  # Caricamento lazy per non aumentare la RAM
-            audio, sr = librosa.load(f"./release_in_the_wild/{row['file']}", sr=None)
+            audio, sr = librosa.load(f"{DIR_PATH}{row['speaker']}/{row['file']}", sr=None)
         else:
             audio, sr = row['audio'], 22050
 
@@ -128,7 +141,7 @@ class AudioDataset(Dataset):
 
 
 # Esempio di utilizzo
-if __name__ != "__main__":
+if __name__ == "__main__":
     # Inizializzazione
     balancer = AudioBalancer(
         reduction_threshold=0.5,
@@ -144,7 +157,9 @@ if __name__ != "__main__":
         else:
             df.loc[i, 'label'] = 1
     #balanced_df = balancer.balance_dataset(df, DIR_PATH)
-
+    for speaker in df['speaker'].unique():
+        speaker_df = df[df['speaker'] == speaker]
+        augmented_df = balancer.augmentation(speaker_df)
     # Salvataggio del dataset bilanciato
     #balanced_df.to_csv('balanced_dataset.csv', index=False)
 
