@@ -4,13 +4,16 @@ import numpy as np
 import pandas as pd
 import librosa
 import soundfile
+import os
 import torch
 from sklearn.model_selection import train_test_split
 from torch.utils.data import Dataset
 from sklearn.cluster import KMeans
 from voicefixer import VoiceFixer
+import audiomentations
 import pytsmod as tsm
 
+AUG_PATH = "./augmented_data/"
 DIR_PATH = './processed_audio/'
 voice_fixer = VoiceFixer() #Da usare solo con GPU
 
@@ -64,6 +67,11 @@ class AudioBalancer:
         return pd.concat([spoof, bona_fide])
 
     def augmentation(self, speaker_df):
+        transform = audiomentations.Compose([
+            #audiomentations.AddGaussianNoise(min_amplitude=10.0, max_amplitude=30.0, p=0.5),
+            audiomentations.PitchShift(min_semitones=-2, max_semitones=2, p=0.5),
+            audiomentations.Gain(min_gain_db=-6.0, max_gain_db=6.0, p=0.3)
+        ])
         spoof = speaker_df[speaker_df['label'] == 0]
         bona_fide = speaker_df[speaker_df['label'] == 1]
 
@@ -79,7 +87,7 @@ class AudioBalancer:
                 augmented_samples = []
                 while len(augmented_samples) < (target_size - len(augment_class)):
                     sample = augment_class.sample(1).iloc[0]
-                    augmented_samples.append(self._augment_audio(sample))
+                    augmented_samples.append(self._augment_audio(sample, transform))
 
                 return pd.concat([spoof, bona_fide, pd.DataFrame(augmented_samples)])
 
@@ -89,15 +97,26 @@ class AudioBalancer:
         audio, sr = librosa.load(f"{path}/{row['speaker']}/{row['file']}", sr=None)
         return np.mean(librosa.feature.mfcc(y=audio, sr=sr, n_mfcc=13), axis=1)
 
-    def _augment_audio(self, row):
+    def _augment_audio(self, row, composer, fixer_prob : float = 0.2):
         """Genera un sample aumentato"""
+        prob = random.random()
+        print(prob)
+        if prob >= fixer_prob:
+            print("faccio voice")
+            cuda = torch.cuda.is_available()
+            os.makedirs(AUG_PATH + row['speaker'], exist_ok=True)
+            voice_fixer.restore(input=os.path.join(DIR_PATH, f"{row['speaker']}/{row['file']}"),
+                                output=os.path.join(AUG_PATH, f"{row['speaker']}/{row['file'][:-4]}_voice.wav"), cuda=cuda, mode=0)
+            return {
+                'file': f"{row['file']}_voice",
+                'speaker': row['speaker'],
+                'label': row['label']
+            }
+        print("niente voice")
         audio, sr = librosa.load(f"{DIR_PATH}{row['speaker']}/{row['file']}", sr=None)
-        print(audio.shape)
-        audioaug = voice_fixer.restore(np.ravel(audio), sr, mode=2, cuda=True)
-        audioaug = tsm.wsola(audioaug, 1.25)
+        audio = composer(audio, sr)
 
-        soundfile.write(f"{DIR_PATH}{row['speaker']}/{row['file']}_augmented", audioaug, samplerate=sr)
-        print(soundfile)
+        soundfile.write(os.path.join(AUG_PATH, f"{row['speaker']}/{row['file'][:-4]}_augmented.wav"), audio, samplerate=sr)
         return {
             'file': f"{row['file']}_augmented",
             'speaker': row['speaker'],
@@ -159,7 +178,7 @@ if __name__ == "__main__":
     #balanced_df = balancer.balance_dataset(df, DIR_PATH)
     for speaker in df['speaker'].unique():
         speaker_df = df[df['speaker'] == speaker]
-        augmented_df = balancer.augmentation(speaker_df)
+        balancer.augmentation(speaker_df)
     # Salvataggio del dataset bilanciato
     #balanced_df.to_csv('balanced_dataset.csv', index=False)
 
