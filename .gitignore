@@ -1,0 +1,12 @@
+# Ignore JetBrains IDE files
+.idea/
+.idea/shelf/
+.idea/workspace.xml
+.idea/httpRequests/
+.idea/dataSources/
+.idea/dataSources.local.xml
+
+# Ignore output folders
+/release_in_the_wild/
+/processed_audio/
+
