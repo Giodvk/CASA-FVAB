@@ -23,7 +23,6 @@ def process_speakers(data):
         spoof_median = speaker_data[speaker_data["label"] == "spoof"]["duration"].median()
         bona_fide_median = speaker_data[speaker_data["label"] == "bona-fide"]["duration"].median()
         valid_medians = [m for m in [spoof_median, bona_fide_median] if not pd.isna(m)]
-        #print(speaker, spoof_median, bona_fide_median, valid_medians)
         if not valid_medians:
             continue
 
