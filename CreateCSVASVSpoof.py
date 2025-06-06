@@ -1,13 +1,11 @@
 import os
 from pathlib import Path
-
 import pandas as pd
 import numpy as np
-import torchaudio
 import torch
 from pydub import AudioSegment
 from torch.utils.data import DataLoader
-from DeepLearningModel import AudioConfig, AudioProcessor, DeepfakeDataset, DeepfakeClassifier
+from DeepLearningModelRESNET import AudioConfig, AudioProcessor, DeepfakeDataset, DeepfakeClassifier
 from sklearn.metrics import accuracy_score, roc_auc_score, roc_curve, classification_report
 
 
@@ -26,19 +24,16 @@ class ASVSpoofProcessor(AudioProcessor):
             # Audio più lungo: applica il ritaglio centrale (center cropping)
             start_sample = (current_num_samples - target_num_samples) // 2
             processed_waveform = waveform[:, start_sample: start_sample + target_num_samples]
-            # print(f"Audio {audio_path} ritagliato da {current_num_samples} a {target_num_samples} campioni.")
         else:  # current_num_samples < target_num_samples
             # Audio più corto: applica il padding con silenzio alla fine
             padding_needed = target_num_samples - current_num_samples
-            # (pad_left, pad_right)
             processed_waveform = torch.nn.functional.pad(waveform, (0, padding_needed))
-            # print(f"Audio {audio_path} riempito da {current_num_samples} a {target_num_samples} campioni.")
         return super(ASVSpoofProcessor, self).extract_features(processed_waveform)
 
 
 
 # ----------------------------------------------------------------------------
-# 3. FUNZIONE PER CALCOLARE L'EQUAL ERROR RATE (EER)
+# FUNZIONE PER CALCOLARE L'EQUAL ERROR RATE (EER)
 # ----------------------------------------------------------------------------
 def calculate_eer(y_true, y_scores_positive_class):
     """
@@ -54,31 +49,29 @@ def calculate_eer(y_true, y_scores_positive_class):
 
 
 # ----------------------------------------------------------------------------
-# 4. FUNZIONE PRINCIPALE DI TEST (MODIFICATA PER CHIAREZZA)
+# FUNZIONE PRINCIPALE DI TEST
 # ----------------------------------------------------------------------------
-def testOnASVspoof(model,  # Il tuo modello PyTorch pre-caricato
-                   asv_csv_path,  # Percorso al file CSV (es. 'tuo_dataset.csv')
-                   audio_root_dir,  # Directory radice dei file audio (es. '/path/to/ASVspoof2021_DF_eval/flac/')
-                   audioProcessor,  # La TUA funzione di estrazione feature
+def testOnASVspoof(model,
+                   asv_csv_path,
+                   audio_root_dir,
+                   audioProcessor,
                    batch_size=64,
-                   label_mapping=None,  # Dizionario opzionale es. {'bonafide': 0, 'spoof': 1}
-                   # Se None, usa il default {'bonafide': 0, 'spoof': 1}
-                   file_extension=".flac"):
+                   label_mapping=None,
+
+                    ):
     """
     Valuta un modello PyTorch su un sottoinsieme di ASVspoof.
     """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"ℹ️ Dispositivo utilizzato: {device}")
+    print(f"Dispositivo utilizzato: {device}")
 
     model.to(device)
     model.eval()  # Imposta il modello in modalità valutazione
 
-    current_label_mapping = label_mapping if label_mapping is not None else {'bonafide': 0, 'spoof': 1}
-    print(f"ℹ️ Utilizzo del mapping etichette: {current_label_mapping}")
-
-    # Nomi per il classification report (se il mapping è {0: 'bonafide', 1: 'spoof'} invertito)
+    current_label_mapping = label_mapping if label_mapping is not None else {'bona-fide': 0, 'spoof': 1}
+    print(f"Utilizzo del mapping etichette: {current_label_mapping}")
     try:
-        # Inverti il mapping per ottenere nomi leggibili dalle etichette numeriche
+
         idx_to_label_name = {v: k for k, v in current_label_mapping.items()}
         report_target_names = [idx_to_label_name[i] for i in sorted(idx_to_label_name.keys())]
     except Exception:
@@ -93,36 +86,31 @@ def testOnASVspoof(model,  # Il tuo modello PyTorch pre-caricato
     )
 
     if len(eval_dataset) == 0:
-        print("⚠️ Il dataset di valutazione è vuoto! Controlla i percorsi e il CSV.")
+        print("Il dataset di valutazione è vuoto! Controlla i percorsi e il CSV.")
         return None
 
     eval_dataloader = DataLoader(
         eval_dataset,
         batch_size=batch_size,
-        shuffle=False,  # Non serve mischiare per la valutazione
+        shuffle=False,
     )
     all_true_labels = []
     all_predicted_classes = []
     all_positive_class_scores = []  # Score per la classe 'spoof' (per EER/AUC)
 
-    print(f"▶️ Inizio valutazione su {len(eval_dataset)} campioni...")
+    print(f"Inizio valutazione su {len(eval_dataset)} campioni...")
     with torch.no_grad():  # Disabilita il calcolo dei gradienti
         for i, (batch_features, batch_true_labels) in enumerate(eval_dataloader):
 
             model_outputs = model(batch_features['mel'].to(device))  # Output raw del modello (logits)
 
-            # --- Elabora l'output del modello ---
-            # Questo dipende da come è fatto l'ultimo layer del tuo modello
-            # e dalla loss function usata in addestramento.
 
-            # Scenario 1: Output logits per 2 classi (es. [logit_bonafide, logit_spoof])
             if model_outputs.ndim > 1 and model_outputs.shape[1] == 2:
                 probabilities = torch.softmax(model_outputs, dim=1)
-                # Assumiamo che la classe 'spoof' sia all'indice 1
+
                 scores_for_spoof_class = probabilities[:, current_label_mapping.get('spoof', 1)]
                 _, predicted_batch_classes = torch.max(probabilities, dim=1)
-            # Scenario 2: Output singolo logit per campione (es. per BCEWithLogitsLoss)
-            # dove un logit positivo indica 'spoof'
+
             elif model_outputs.ndim == 1 or (model_outputs.ndim == 2 and model_outputs.shape[1] == 1):
                 model_outputs = model_outputs.squeeze()  # Assicura sia 1D
                 scores_for_spoof_class = torch.sigmoid(model_outputs)  # Probabilità
@@ -140,7 +128,7 @@ def testOnASVspoof(model,  # Il tuo modello PyTorch pre-caricato
             if (i + 1) % (max(1, len(eval_dataloader) // 10)) == 0:  # Stampa progresso circa 10 volte
                 print(f"  Elaborato batch {i + 1}/{len(eval_dataloader)}")
 
-    print("✅ Valutazione completata. Calcolo metriche...")
+    print("Valutazione completata. Calcolo metriche...")
 
     # Converti liste in array NumPy
     y_true_np = np.array(all_true_labels)
@@ -151,7 +139,7 @@ def testOnASVspoof(model,  # Il tuo modello PyTorch pre-caricato
     accuracy = accuracy_score(y_true_np, y_pred_classes_np)
 
     if len(np.unique(y_true_np)) < 2:  # Controlla se c'è almeno una istanza per ogni classe
-        print("⚠️ Trovata solo una classe nelle etichette vere. AUC e EER potrebbero essere non definiti o fuorvianti.")
+        print("Trovata solo una classe nelle etichette vere. AUC e EER potrebbero essere non definiti o fuorvianti.")
         auc = float('nan')
         eer = float('nan')
     else:
@@ -168,11 +156,11 @@ def testOnASVspoof(model,  # Il tuo modello PyTorch pre-caricato
             eer = float('nan')
 
     print("\n--- Risultati della Valutazione ---")
-    print(f"🎯 Accuratezza: {accuracy:.4f}")
-    print(f"📈 AUC: {auc:.4f}")
-    print(f"📊 EER: {eer:.2f}%")  # EER è spesso riportato come percentuale
+    print(f"Accuratezza: {accuracy:.4f}")
+    print(f"AUC: {auc:.4f}")
+    print(f"EER: {eer:.2f}%")
 
-    print("\n📋 Classification Report:")
+    print("\nClassification Report:")
     print(classification_report(y_true_np, y_pred_classes_np, target_names=report_target_names, digits=4))
 
     results = {"accuracy": accuracy, "auc": auc, "eer": eer}
@@ -181,13 +169,13 @@ def testOnASVspoof(model,  # Il tuo modello PyTorch pre-caricato
 
 def CreateCSVASVSpoof(pathKey):
     data = []
-
+    label = {'bonafide': 'bona-fide', 'spoof': 'spoof'}
     with open(pathKey,'r') as csvfile:
         for line in csvfile.readlines():
             df = {}
             split_line = line.split(' ')
             name_audio = split_line[1]
-            label_audio = split_line[5]
+            label_audio = label[split_line[5]]
             df.update({'file': name_audio+".wav", 'label': label_audio})
             data.append(df)
     return pd.DataFrame(data)
@@ -219,7 +207,6 @@ if __name__ == '__main__':
     df.to_csv("ASVSpoofData.csv", index=False, columns=['file', 'label'])
     modelPath = 'best_hardened_detector.pth'
     modelArchitecture = DeepfakeClassifier()
-    # Caricamento forzato, solo se ti fidi della fonte del file
     state_dict = torch.load(modelPath, map_location=torch.device('cuda'), weights_only=False)
     modelArchitecture.load_state_dict(state_dict['model_state_dict'])
     modelArchitecture.to(device="cuda")
