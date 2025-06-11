@@ -1,22 +1,12 @@
-import random
-
 import numpy as np
 import pandas as pd
 import librosa
-import soundfile
-import os
 import torch
 from sklearn.model_selection import train_test_split
 from torch.utils.data import Dataset
 from sklearn.cluster import KMeans
-from voicefixer import VoiceFixer
-import audiomentations
-import pytsmod as tsm
 
-AUG_PATH = "./augmented_data/"
 DIR_PATH = './processed_audio/'
-voice_fixer = VoiceFixer() #Da usare solo con GPU
-
 
 class AudioBalancer:
     def __init__(self, reduction_threshold=0.4, augmentation_threshold=0.2,
@@ -66,61 +56,39 @@ class AudioBalancer:
 
         return pd.concat([spoof, bona_fide])
 
-    def augmentation(self, speaker_df):
-        transform = audiomentations.Compose([
-            #audiomentations.AddGaussianNoise(min_amplitude=10.0, max_amplitude=30.0, p=0.5),
-            audiomentations.PitchShift(min_semitones=-2, max_semitones=2, p=0.5),
-            audiomentations.Gain(min_gain_db=-6.0, max_gain_db=6.0, p=0.3)
-        ])
-        spoof = speaker_df[speaker_df['label'] == 0]
-        bona_fide = speaker_df[speaker_df['label'] == 1]
+    def _augmentation(self, speaker_df):
+        """"
+                # Data Augmentation per sbilanciamenti residui
+                if abs(imbalance) > self.augmentation_threshold:
+                    if len(spoof) < len(bona_fide):
+                        augment_class = spoof
+                        target_size = int(len(bona_fide) * self.augmentation_factor)
+                    else:
+                        augment_class = bona_fide
+                        target_size = int(len(spoof) * self.augmentation_factor)
 
-        # Calcola lo sbilanciamento
-        imbalance = (len(bona_fide) - len(spoof)) / (len(bona_fide) + 1e-8)
+                    augmented_samples = []
+                    while len(augmented_samples) < (target_size - len(augment_class)):
+                        sample = augment_class.sample(1).iloc[0]
+                        augmented_samples.append(self._augment_audio(sample))
 
-        # Data Augmentation per sbilanciamenti residui
-        if abs(imbalance) > self.augmentation_threshold:
-            if len(spoof) < len(bona_fide):
-                augment_class = spoof
-                target_size = int(len(bona_fide) * self.augmentation_factor)
-                print("Augmentation")
-                augmented_samples = []
-                while len(augmented_samples) < (target_size - len(augment_class)):
-                    sample = augment_class.sample(1).iloc[0]
-                    augmented_samples.append(self._augment_audio(sample, transform))
-
-                return pd.concat([spoof, bona_fide, pd.DataFrame(augmented_samples)])
-
+                    return pd.concat([spoof, bona_fide, pd.DataFrame(augmented_samples)])
+                    """
 
     def _extract_mfcc(self, row, path):
         """Estrae features MFCC da un file audio"""
         audio, sr = librosa.load(f"{path}/{row['speaker']}/{row['file']}", sr=None)
         return np.mean(librosa.feature.mfcc(y=audio, sr=sr, n_mfcc=13), axis=1)
 
-    def _augment_audio(self, row, composer, fixer_prob : float = 0.2):
+    def _augment_audio(self, row):
         """Genera un sample aumentato"""
-        prob = random.random()
-        print(prob)
-        if prob >= fixer_prob:
-            print("faccio voice")
-            cuda = torch.cuda.is_available()
-            os.makedirs(AUG_PATH + row['speaker'], exist_ok=True)
-            voice_fixer.restore(input=os.path.join(DIR_PATH, f"{row['speaker']}/{row['file']}"),
-                                output=os.path.join(AUG_PATH, f"{row['speaker']}/{row['file'][:-4]}_voice.wav"), cuda=cuda, mode=0)
-            return {
-                'file': f"{row['file']}_voice",
-                'speaker': row['speaker'],
-                'label': row['label']
-            }
-        print("niente voice")
-        audio, sr = librosa.load(f"{DIR_PATH}{row['speaker']}/{row['file']}", sr=None)
-        audio = composer(audio, sr)
-
-        soundfile.write(os.path.join(AUG_PATH, f"{row['speaker']}/{row['file'][:-4]}_augmented.wav"), audio, samplerate=sr)
+        audio, sr = librosa.load(f"./release_in_the_wild/{row['file']}", sr=None)
+        augmented = self.augmenter(samples=audio, sample_rate=sr)
         return {
-            'file': f"{row['file']}_augmented",
+            'file': f"augmented_{row['file']}",
             'speaker': row['speaker'],
-            'label': row['label']
+            'label': row['label'],
+            'audio': augmented
         }
 
     def balance_dataset(self, df, path):
@@ -148,7 +116,7 @@ class AudioDataset(Dataset):
         row = self.df.iloc[idx]
 
         if 'audio' not in row:  # Caricamento lazy per non aumentare la RAM
-            audio, sr = librosa.load(f"{DIR_PATH}{row['speaker']}/{row['file']}", sr=None)
+            audio, sr = librosa.load(f"./release_in_the_wild/{row['file']}", sr=None)
         else:
             audio, sr = row['audio'], 22050
 
@@ -160,7 +128,7 @@ class AudioDataset(Dataset):
 
 
 # Esempio di utilizzo
-if __name__ == "__main__":
+if __name__ != "__main__":
     # Inizializzazione
     balancer = AudioBalancer(
         reduction_threshold=0.5,
@@ -176,11 +144,9 @@ if __name__ == "__main__":
         else:
             df.loc[i, 'label'] = 1
     #balanced_df = balancer.balance_dataset(df, DIR_PATH)
-    for speaker in df['speaker'].unique():
-        speaker_df = df[df['speaker'] == speaker]
-        balancer.augmentation(speaker_df)
+
     # Salvataggio del dataset bilanciato
     #balanced_df.to_csv('balanced_dataset.csv', index=False)
-
+    df.sort_values(by='speaker', ascending=True, inplace=True)
     speaker = df['speaker'].unique()
-    train_speaker, test_speaker = train_test_split(speaker, test_size=0.2)
+    train_speaker, test_speaker = train_test_split(speaker, test_size=0.2, random_state=42)

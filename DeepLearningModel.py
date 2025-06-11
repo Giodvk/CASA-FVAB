@@ -3,23 +3,17 @@ import logging
 import numpy as np
 import torch
 import torch.nn as nn
-import torchaudio
-import librosa
+
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass
-import collections
 import pandas as pd # Added for CSV reading
+from sklearn.metrics import precision_recall_fscore_support, roc_curve
+from scipy.optimize import brentq
+from scipy.interpolate import interp1d
 
-# Assuming DataBalancingDeepSeek.py exists, but its speaker lists are no longer directly used for splits
-# for deepfake detection, as the CSV will define the data.
-try:
-    from DataBalancingDeepSeek import train_speaker, test_speaker
-except ImportError:
-    print("Warning: DataBalancingDeepSeek.py not found or train_speaker/test_speaker not defined.")
-    print("This is okay for deepfake detection, as splits are now handled via CSV metadata.")
-    train_speaker = [] # Placeholder to avoid NameError if not found
-    test_speaker = [] # Placeholder to avoid NameError if not found
+from dataAudio import AudioConfig, AudioProcessor, DeepfakeDataset
+from DataBalancingDeepSeek import train_speaker, test_speaker
 
 
 logger = logging.getLogger(__name__)
@@ -36,196 +30,7 @@ def collate_fn_skip_none(batch):
         return None
     return torch.utils.data.dataloader.default_collate(batch)
 
-@dataclass
-class AudioConfig:
-    sample_rate: int = 16000
-    n_fft: int = 1024
-    hop_length: int = 512
-    n_mels: int = 64
-    win_length: int = 1024
-    f_min: float = 20.0
-    f_max: float = 8000.0
-    mfcc_bins: int = 40 # Number of MFCCs to return
-    max_duration: float = 5.0  # seconds, for potential padding/truncating if needed
 
-
-class AudioProcessor:
-    def __init__(self, config: AudioConfig):
-        self.config = config
-        self._mel_basis = None
-        self.mfcc_transform = torchaudio.transforms.MFCC(
-            sample_rate=self.config.sample_rate,
-            n_mfcc=self.config.mfcc_bins,
-            melkwargs={
-                'n_fft': self.config.n_fft,
-                'hop_length': self.config.hop_length,
-                'n_mels': self.config.n_mels,
-                'f_min': self.config.f_min,
-                'f_max': self.config.f_max,
-                'win_length': self.config.win_length,
-            },
-            log_mels=True
-        )
-
-    @property
-    def mel_basis(self):
-        if self._mel_basis is None:
-            self._mel_basis = librosa.filters.mel(
-                sr=self.config.sample_rate,
-                n_fft=self.config.n_fft,
-                n_mels=self.config.n_mels,
-                fmin=self.config.f_min,
-                fmax=self.config.f_max
-            )
-        return self._mel_basis
-
-    def load_audio(self, path: Path) -> torch.Tensor:
-        try:
-            waveform, sr = torchaudio.load(path, normalize=True)
-        except Exception as e:
-            logger.error(f"Error loading audio file {path}: {e}")
-            return torch.empty(0)
-
-        if waveform.numel() == 0:
-            logger.warning(f"Audio file {path} is empty or could not be loaded.")
-            return torch.empty(0)
-
-        if sr != self.config.sample_rate:
-            resampler = torchaudio.transforms.Resample(
-                orig_freq=sr,
-                new_freq=self.config.sample_rate
-            )
-            waveform = resampler(waveform)
-
-        max_samples = int(self.config.max_duration * self.config.sample_rate)
-        if waveform.shape[-1] > max_samples:
-            waveform = waveform[..., :max_samples]
-        elif waveform.shape[-1] < max_samples:
-            padding_needed = max_samples - waveform.shape[-1]
-            waveform = torch.nn.functional.pad(waveform, (0, padding_needed))
-
-        return waveform.squeeze(0)
-
-    def extract_features(self, waveform: torch.Tensor) -> Dict[str, torch.Tensor]:
-        if waveform.numel() == 0:
-            logger.warning("Cannot extract features from empty waveform.")
-            dummy_mel_frames = int(self.config.max_duration * self.config.sample_rate / self.config.hop_length) + 1
-            return {
-                "zcr": torch.zeros(1, dummy_mel_frames),
-                "rmse": torch.zeros(1, dummy_mel_frames),
-                "mel": torch.zeros(self.config.n_mels, dummy_mel_frames),
-                "mfcc": torch.zeros(self.config.mfcc_bins, dummy_mel_frames)
-            }
-
-        features = {}
-        wf_for_frames = waveform.unsqueeze(0) if waveform.dim() == 1 else waveform
-
-        features["zcr"] = self._zero_crossing_rate(wf_for_frames)
-        features["rmse"] = self._root_mean_square_energy(wf_for_frames)
-
-        window = torch.hann_window(self.config.win_length, device=waveform.device)
-
-        stft_result = torch.stft(
-            waveform,
-            n_fft=self.config.n_fft,
-            hop_length=self.config.hop_length,
-            win_length=self.config.win_length,
-            window=window,
-            return_complex=True
-        )
-        magnitude = torch.abs(stft_result)
-
-        mel_basis_tensor = torch.tensor(self.mel_basis, dtype=magnitude.dtype, device=magnitude.device)
-        mel_spec = mel_basis_tensor @ magnitude
-        features["mel"] = torch.log(mel_spec + 1e-6)
-
-        mfcc_input = waveform.unsqueeze(0) if waveform.dim() == 1 else waveform
-        features["mfcc"] = self.mfcc_transform(mfcc_input).squeeze(0)
-
-        return features
-
-    def _zero_crossing_rate(self, waveform: torch.Tensor) -> torch.Tensor:
-        if waveform.dim() == 1:
-            waveform = waveform.unsqueeze(0)
-        frames = waveform.unfold(dimension=-1, size=self.config.win_length, step=self.config.hop_length)
-        sign_changes = (frames[..., :-1] * frames[..., 1:] < 0).sum(dim=-1).float()
-        zcr = sign_changes / (self.config.win_length - 1)
-        return zcr
-
-    def _root_mean_square_energy(self, waveform: torch.Tensor) -> torch.Tensor:
-        if waveform.dim() == 1:
-            waveform = waveform.unsqueeze(0)
-        frames = waveform.unfold(dimension=-1, size=self.config.win_length, step=self.config.hop_length)
-        mse = frames.pow(2).mean(dim=-1)
-        rmse = torch.sqrt(mse + 1e-10)
-        return rmse
-
-
-class DeepfakeDataset(torch.utils.data.Dataset): # Renamed from SpeakerDataset
-    def __init__(
-            self,
-            root_dir: Path,
-            metadata_df: pd.DataFrame, # Pass a DataFrame directly
-            processor: AudioProcessor,
-            augment: bool = False,
-    ):
-        self.root_dir = root_dir
-        self.metadata_df = metadata_df
-        self.processor = processor
-        self.augment = augment
-
-        # Map 'bona-fide' to 0 and 'spoof' to 1
-        self.label_map = {'bona-fide': 0, 'spoof': 1}
-        self.samples = self._load_samples()
-        if not self.samples:
-            logger.warning(f"No audio samples found based on provided metadata in {root_dir}. Dataset is empty.")
-        self._init_augmentations()
-
-    def _load_samples(self) -> List[Dict]:
-        samples = []
-        for idx, row in self.metadata_df.iterrows():
-            # CORRECTED: Construct path as root_dir / speaker / file
-            audio_path = self.root_dir / row['speaker'] / row['file']
-            if not audio_path.exists():
-                logger.warning(f"Audio file {audio_path} not found. Skipping.")
-                continue
-            samples.append({
-                "path": audio_path,
-                "speaker": row['speaker'],
-                "label": self.label_map[row['label']] # Convert 'bona-fide'/'spoof' to 0/1
-            })
-        return samples
-
-    def _init_augmentations(self):
-        self.spec_augment_chain = None
-        if self.augment:
-            self.spec_augment_chain = torch.nn.Sequential(
-                torchaudio.transforms.FrequencyMasking(freq_mask_param=self.processor.config.n_mels // 8),
-                torchaudio.transforms.TimeMasking(time_mask_param=35)
-            )
-
-    def __getitem__(self, idx: int) -> Optional[Tuple[Dict[str, torch.Tensor], int]]:
-        if idx >= len(self.samples):
-            raise IndexError("Index out of bounds")
-
-        sample_info = self.samples[idx]
-        waveform = self.processor.load_audio(sample_info["path"])
-
-        if waveform.numel() == 0:
-            logger.warning(f"Skipping sample {sample_info['path']} due to loading error or empty audio. Returning None.")
-            return None
-
-        features = self.processor.extract_features(waveform)
-
-        if self.augment and self.spec_augment_chain is not None:
-            features["mel"] = self.spec_augment_chain(features["mel"].unsqueeze(0)).squeeze(0)
-
-        # The label is now 0 for bona-fide, 1 for spoof
-        deepfake_label = sample_info["label"]
-        return features, deepfake_label
-
-    def __len__(self) -> int:
-        return len(self.samples)
 class ResidualBlock(nn.Module):
     def __init__(self, in_channels: int, out_channels: int, stride: int = 1):
         super().__init__()
@@ -262,7 +67,7 @@ class DeepfakeClassifier(nn.Module): # Renamed from SpeakerClassifier
             dropout: float = 0.2,
             initial_channels: int = 32,
             resnet_channels: List[int] = [32, 64, 128, 256],
-            resnet_blocks: List[int] = [1, 1, 1, 1],
+            resnet_blocks: List[int] = [2, 2, 2, 2],
             classifier_hidden_dim: int = 256
     ):
         super().__init__()
@@ -327,9 +132,15 @@ def train(
         criterion: torch.nn.Module,
         device: torch.device,
         epochs: int = 50,
+        save_path: str = "best_model_deepfake.pth"  # Add save_path parameter
 ) -> Dict[str, List[float]]:
     best_val_acc = 0.0
-    metrics = {"train_loss": [], "val_acc": [], "train_acc": [], "val_loss": []}
+    metrics = {
+        "train_loss": [], "val_loss": [],
+        "train_acc": [], "val_acc": [],
+        "val_precision": [], "val_recall": [],
+        "val_eer": []
+    }
 
     for epoch in range(epochs):
         model.train()
@@ -370,30 +181,45 @@ def train(
 
         # Validation
         if val_loader:
-            val_acc, val_loss = evaluate(model, val_loader, criterion, device)
+            val_acc, val_loss, val_precision, val_recall, val_eer = evaluate(
+                model, val_loader, criterion, device
+            )
+            
+            # Store metrics
             metrics["val_acc"].append(val_acc)
             metrics["val_loss"].append(val_loss)
-            logger.info(f"Epoch {epoch}/{epochs-1} Summary: Train Loss: {avg_epoch_train_loss:.4f}, Train Acc: {avg_epoch_train_acc:.4f} | Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f}")
-            if scheduler:
-                if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-                    scheduler.step(val_acc)
-                else:
-                    scheduler.step()
+            metrics["val_precision"].append(val_precision)
+            metrics["val_recall"].append(val_recall)
+            metrics["val_eer"].append(val_eer)
+            
+            logger.info(
+                f"Epoch {epoch}/{epochs-1} Summary:\n"
+                f"  Train Loss: {avg_epoch_train_loss:.4f}, Acc: {avg_epoch_train_acc:.4f}\n"
+                f"  Val Loss: {val_loss:.4f}, Acc: {val_acc:.4f}\n"
+                f"  Precision: {val_precision:.4f}, Recall: {val_recall:.4f}, EER: {val_eer:.4f}"
+            )
+            
+            # Save best model based on validation accuracy
             if val_acc > best_val_acc:
                 best_val_acc = val_acc
-                try:
-                    torch.save(model.state_dict(), "best_model_deepfake.pth") # Changed model name
-                    logger.info(f"New best model saved with Val Acc: {best_val_acc:.4f}")
-                except Exception as e:
-                    logger.error(f"Error saving model: {e}")
+                torch.save(model.state_dict(), save_path)
+                logger.info(f"New best model saved with validation accuracy: {val_acc:.4f}")
+            
+            # Update scheduler with validation accuracy
+            if scheduler and isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                scheduler.step(val_acc)
         else:
             logger.info(f"Epoch {epoch}/{epochs-1} Summary: Train Loss: {avg_epoch_train_loss:.4f}, Train Acc: {avg_epoch_train_acc:.4f} | No validation.")
             metrics["val_acc"].append(0.0)
             metrics["val_loss"].append(0.0)
+            metrics["val_precision"].append(0.0)
+            metrics["val_recall"].append(0.0)
+            metrics["val_eer"].append(0.0)
+            
             if scheduler and not isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-                 scheduler.step()
+                scheduler.step()
 
-    logger.info(f"Training finished. Best Validation Accuracy (if applicable): {best_val_acc:.4f}")
+    logger.info(f"Training finished. Best Validation Accuracy: {best_val_acc:.4f}")
     return metrics
 
 def evaluate(
@@ -401,16 +227,21 @@ def evaluate(
         data_loader: torch.utils.data.DataLoader,
         criterion: torch.nn.Module,
         device: torch.device,
-) -> Tuple[float, float]:
+) -> Tuple[float, float, float, float, float]:
+    """Evaluate model and compute additional metrics"""
     model.eval()
     total_correct = 0
     total_samples = 0
     total_loss = 0.0
+    
+    # For detailed metrics
+    all_labels = []
+    all_preds = []
+    all_scores = []
 
     with torch.no_grad():
         for batch_idx, batch_data in enumerate(data_loader):
             if batch_data is None:
-                logger.warning(f"Skipping None batch at index {batch_idx} during evaluation (collate_fn returned None).")
                 continue
 
             features_dict, labels = batch_data
@@ -421,13 +252,41 @@ def evaluate(
             loss = criterion(outputs, labels)
             total_loss += loss.item() * mel_spectrograms.size(0)
 
+            # Get predictions and scores
+            probs = torch.softmax(outputs, dim=1)
+            scores = probs[:, 1]  # Probability of being spoof
             preds = outputs.argmax(dim=1)
+            
             total_correct += preds.eq(labels).sum().item()
             total_samples += labels.size(0)
+            
+            # Store for metric calculation
+            all_labels.append(labels.cpu().numpy())
+            all_preds.append(preds.cpu().numpy())
+            all_scores.append(scores.cpu().numpy())
 
-    accuracy = total_correct / total_samples if total_samples > 0 else 0
-    average_loss = total_loss / total_samples if total_samples > 0 else 0
-    return accuracy, average_loss
+    if total_samples == 0:
+        return 0.0, 0.0, 0.0, 0.0, 0.0
+
+    accuracy = total_correct / total_samples
+    average_loss = total_loss / total_samples
+    
+    # Compute additional metrics
+    all_labels = np.concatenate(all_labels)
+    all_preds = np.concatenate(all_preds)
+    all_scores = np.concatenate(all_scores)
+    
+    # Precision, Recall, F1
+    precision, recall, f1, _ = precision_recall_fscore_support(
+        all_labels, all_preds, average='binary', zero_division=0
+    )
+    
+    # Equal Error Rate (EER)
+    fpr, tpr, thresholds = roc_curve(all_labels, all_scores)
+    eer = brentq(lambda x: 1. - x - interp1d(fpr, tpr)(x), 0., 1.)
+    
+    return accuracy, average_loss, precision, recall, eer
+
 
 def main():
     parser = argparse.ArgumentParser(description="Deepfake Detection Training with ResNet")
@@ -445,22 +304,21 @@ def main():
     parser.add_argument("--test_split_ratio", type=float, default=0.2,
                         help="Ratio of unique speakers to reserve for the test set (e.g., 0.2 for 20%).")
 
-
     # Model architecture arguments
     parser.add_argument("--initial_channels", type=int, default=32, help="Initial channels in the ResNet backbone.")
     parser.add_argument("--resnet_channels", nargs="+", type=int, default=[32, 64, 128, 256],
                         help="List of channel sizes for each ResNet block stage.")
-    parser.add_argument("--resnet_blocks", nargs="+", type=int, default=[1, 1, 1, 1],
+    parser.add_argument("--resnet_blocks", nargs="+", type=int, default=[1, 1, 1, 1],  # Fixed type annotation
                         help="Number of residual blocks in each ResNet stage.")
     parser.add_argument("--classifier_hidden_dim", type=int, default=256,
                         help="Hidden dimension for the final classifier layer.")
-
 
     args = parser.parse_args()
 
     logger.info(f"Starting deepfake detection training with args: {args}")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Using device: {device}")
+    
     if args.num_workers > 0 and device.type == 'cuda':
         if torch.multiprocessing.get_start_method(allow_none=True) != 'spawn':
             logger.info(f"Setting multiprocessing start method to 'spawn' for CUDA compatibility with num_workers > 0.")
@@ -468,7 +326,6 @@ def main():
                 torch.multiprocessing.set_start_method('spawn', force=True)
             except RuntimeError as e:
                 logger.warning(f"Could not set multiprocessing start method to 'spawn': {e}. This might cause issues with CUDA in child processes.")
-
 
     audio_conf = AudioConfig()
     processor = AudioProcessor(audio_conf)
@@ -491,7 +348,7 @@ def main():
     if not all(label in ['bona-fide', 'spoof'] for label in full_metadata_df['label'].unique()):
         logger.error("The 'label' column must only contain 'bona-fide' or 'spoof' values. Exiting.")
         return
-
+    """
     # Get all unique speakers
     all_speakers = full_metadata_df['speaker'].unique().tolist()
     np.random.shuffle(all_speakers) # Shuffle speakers for random split
@@ -513,10 +370,10 @@ def main():
     logger.info(f"Training speakers IDs (first 5): {train_speakers[:5]} ... (last 5): {train_speakers[-5:]}")
     logger.info(f"Number of testing speakers: {len(test_speakers)}")
     logger.info(f"Testing speakers IDs (first 5): {test_speakers[:5]} ... (last 5): {test_speakers[-5:] if test_speakers else 'N/A'}")
-
+    """
     # Create train and test DataFrames based on speaker IDs
-    train_metadata_df = full_metadata_df[full_metadata_df['speaker'].isin(train_speakers)].reset_index(drop=True)
-    test_metadata_df = full_metadata_df[full_metadata_df['speaker'].isin(test_speakers)].reset_index(drop=True)
+    train_metadata_df = full_metadata_df[full_metadata_df['speaker'].isin(train_speaker)].reset_index(drop=True)
+    test_metadata_df = full_metadata_df[full_metadata_df['speaker'].isin(test_speaker)].reset_index(drop=True)
 
     # --- Data Statistics: Samples per Speaker and Bona-fide/Spoof Balance ---
     logger.info("\n--- Training Data Statistics ---")
@@ -643,6 +500,7 @@ def main():
 
 
     logger.info("Starting training...")
+    save_path = "best_model_deepfake.pth"
     metrics = train(
         model,
         train_loader,
@@ -651,31 +509,65 @@ def main():
         scheduler,
         criterion,
         device,
-        args.epochs
+        args.epochs,
+        save_path  # Pass the save path
     )
 
     logger.info(f"Training completed. Metrics: {metrics}")
     logger.info(f"Best model saved to best_model_deepfake.pth (if validation accuracy improved).")
-
+    
     if test_loader:
         logger.info("Loading best model for final evaluation on the test set...")
         try:
-            final_model = DeepfakeClassifier(
-                num_classes=2, # Fixed to 2
-                config=audio_conf,
-                dropout=args.dropout,
-                initial_channels=args.initial_channels,
-                resnet_channels=args.resnet_channels,
-                resnet_blocks=args.resnet_blocks,
-                classifier_hidden_dim=args.classifier_hidden_dim
-            ).to(device)
-            final_model.load_state_dict(torch.load("best_model_deepfake.pth", map_location=device))
-            final_test_acc, final_test_loss = evaluate(final_model, test_loader, criterion, device)
-            logger.info(f"Final Test Accuracy (best model): {final_test_acc:.4f}, Final Test Loss: {final_test_loss:.4f}")
-        except FileNotFoundError:
-            logger.warning("best_model_deepfake.pth not found. Skipping final evaluation with best model.")
+            # Check if the model file exists
+            if not Path(save_path).exists():
+                logger.warning(f"Best model file {save_path} not found. Using current model state for evaluation.")
+                final_model = model
+            else:
+                # Create a new model instance with the same parameters
+                final_model = DeepfakeClassifier(
+                    num_classes=2,
+                    config=audio_conf,
+                    dropout=args.dropout,
+                    initial_channels=args.initial_channels,
+                    resnet_channels=args.resnet_channels,
+                    resnet_blocks=args.resnet_blocks,
+                    classifier_hidden_dim=args.classifier_hidden_dim
+                ).to(device)
+                
+                # Load the saved state
+                final_model.load_state_dict(torch.load(save_path, map_location=device))
+                logger.info(f"Successfully loaded best model from {save_path}")
+            
+            test_acc, test_loss, test_precision, test_recall, test_eer = evaluate(
+                final_model, test_loader, criterion, device
+            )
+            
+            logger.info(
+                f"Final Test Results:\n"
+                f"  Accuracy: {test_acc:.4f}\n"
+                f"  Loss: {test_loss:.4f}\n"
+                f"  Precision: {test_precision:.4f}\n"
+                f"  Recall: {test_recall:.4f}\n"
+                f"  EER: {test_eer:.4f}"
+            )
         except Exception as e:
-            logger.error(f"Error during final evaluation with best model: {e}")
+            logger.error(f"Error during final evaluation: {e}")
+            logger.info("Attempting evaluation with current model state...")
+            try:
+                test_acc, test_loss, test_precision, test_recall, test_eer = evaluate(
+                    model, test_loader, criterion, device
+                )
+                logger.info(
+                    f"Final Test Results (current model):\n"
+                    f"  Accuracy: {test_acc:.4f}\n"
+                    f"  Loss: {test_loss:.4f}\n"
+                    f"  Precision: {test_precision:.4f}\n"
+                    f"  Recall: {test_recall:.4f}\n"
+                    f"  EER: {test_eer:.4f}"
+                )
+            except Exception as e2:
+                logger.error(f"Error during fallback evaluation: {e2}")
     else:
         logger.info("Skipping final evaluation on test set as test loader was not available.")
 

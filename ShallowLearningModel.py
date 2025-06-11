@@ -65,7 +65,7 @@ def train_and_evaluate(train_df: pd.DataFrame, test_df: pd.DataFrame):
     y_prob = clf.predict_proba(X_test_scaled)[:, 1] if hasattr(clf, "predict_proba") else None
 
     # Metriche
-    print("📊 Performance metrics:")
+    print("Performance metrics:")
     print(f"Accuracy      : {accuracy_score(y_test, y_pred):.4f}")
     print(f"Recall        : {recall_score(y_test, y_pred, average='macro'):.4f}")
     if y_prob is not None and len(np.unique(y_test)) == 2:
@@ -75,7 +75,7 @@ def train_and_evaluate(train_df: pd.DataFrame, test_df: pd.DataFrame):
 
 
 # === ESECUZIONE ===
-
-train_df = prepare_data(train_speaker, DIR_PATH, DIR_PATH)
-test_df = prepare_data(test_speaker, DIR_PATH, DIR_PATH)
-train_and_evaluate(train_df, test_df)
+if __name__ == "__main__":
+    train_df = prepare_data(train_speaker, DIR_PATH, DIR_PATH)
+    test_df = prepare_data(test_speaker, DIR_PATH, DIR_PATH)
+    train_and_evaluate(train_df, test_df)

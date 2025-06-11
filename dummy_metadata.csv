@@ -1,0 +1,11 @@
+speaker,file,label
+s0,f0.wav,bona-fide
+s1,f1.wav,spoof
+s2,f2.wav,bona-fide
+s3,f3.wav,spoof
+s4,f4.wav,bona-fide
+s5,f5.wav,spoof
+s6,f6.wav,bona-fide
+s7,f7.wav,spoof
+s8,f8.wav,bona-fide
+s9,f9.wav,spoof
