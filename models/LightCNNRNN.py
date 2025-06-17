@@ -5,11 +5,11 @@ import pandas as pd
 from torch import optim
 
 from DeepLearningModel import DeepfakeDataset, AudioProcessor, AudioConfig
-from DataBalancingDeepSeek import train_speaker, test_speaker
+from split_dataset import train_speaker, test_speaker
 from light_cnn import network_29layers_v2, resblock
 
 
-DIR_PATH = Path('./processed_audio/chunkedDf.csv')
+DIR_PATH = Path('C:\\Users\dmc\PycharmProjects\CASA-FVAB\processed_audio\chunkedDf.csv')
 
 
 class ModifiedLightCNN(network_29layers_v2):
@@ -151,8 +151,8 @@ def main():
     model = LightCNNRNN()
     model.to(device)
     torch.compile(model)
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
-    train_loader, valid_loader, pos_weight = prepare_loader(df, train_speaker, valid_speakers=test_speaker, batch_size=64)
+    optimizer = optim.Adam(model.parameters(), lr=1e-4)
+    train_loader, valid_loader, pos_weight = prepare_loader(df, train_speaker, valid_speakers=test_speaker, batch_size=256)
     loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
     num_epochs = 20

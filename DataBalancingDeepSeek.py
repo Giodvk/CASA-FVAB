@@ -1,12 +1,19 @@
+import random
+import os
+from tqdm import tqdm
+import soundfile
+from voicefixer import VoiceFixer
+import audiomentations
 import numpy as np
 import pandas as pd
 import librosa
 import torch
 from sklearn.model_selection import train_test_split
-from torch.utils.data import Dataset
 from sklearn.cluster import KMeans
 
-DIR_PATH = './processed_audio/'
+DIR_PATH = 'C:/Users/dmc/PycharmProjects/CASA-FVAB/processed_audio/'
+AUG_PATH = "./augmented_data/"
+voice_fixer = VoiceFixer()
 
 class AudioBalancer:
     def __init__(self, reduction_threshold=0.4, augmentation_threshold=0.2,
@@ -56,39 +63,58 @@ class AudioBalancer:
 
         return pd.concat([spoof, bona_fide])
 
-    def _augmentation(self, speaker_df):
-        """"
-                # Data Augmentation per sbilanciamenti residui
-                if abs(imbalance) > self.augmentation_threshold:
-                    if len(spoof) < len(bona_fide):
-                        augment_class = spoof
-                        target_size = int(len(bona_fide) * self.augmentation_factor)
-                    else:
-                        augment_class = bona_fide
-                        target_size = int(len(spoof) * self.augmentation_factor)
+    def augmentation(self, df):
+        transform = audiomentations.Compose([
+            audiomentations.PitchShift(min_semitones=-2, max_semitones=2, p=0.5),
+            audiomentations.Gain(min_gain_db=-6.0, max_gain_db=6.0, p=0.3)
+        ])
 
-                    augmented_samples = []
-                    while len(augmented_samples) < (target_size - len(augment_class)):
-                        sample = augment_class.sample(1).iloc[0]
-                        augmented_samples.append(self._augment_audio(sample))
+        # Step 2: Creazione dataset aumentato
+        augmented_data = []
+        for _, row in tqdm(df.iterrows(), total=len(df)):
+            if row['label'] == 0:
+                augmented_data.append(balancer._augment_audio(row, transform))
 
-                    return pd.concat([spoof, bona_fide, pd.DataFrame(augmented_samples)])
-                    """
+            if random.random() < 0.3:  # 30% di real augmentati
+                augmented_data.append(balancer._augment_audio(row, transform, fixer_prob=0))
+
+        # Step 3: Unione con metadati
+        aug_df = pd.DataFrame(augmented_data)
+        final_df = pd.concat([df, aug_df], ignore_index=True)
+
+        # Step 4: Salvataggio
+        final_df.to_csv('augmented_dataset.csv', index=False)
 
     def _extract_mfcc(self, row, path):
         """Estrae features MFCC da un file audio"""
         audio, sr = librosa.load(f"{path}/{row['speaker']}/{row['file']}", sr=None)
         return np.mean(librosa.feature.mfcc(y=audio, sr=sr, n_mfcc=13), axis=1)
 
-    def _augment_audio(self, row):
+    def _augment_audio(self, row, composer, fixer_prob: float = 0.2):
         """Genera un sample aumentato"""
-        audio, sr = librosa.load(f"./release_in_the_wild/{row['file']}", sr=None)
-        augmented = self.augmenter(samples=audio, sample_rate=sr)
+        prob = random.random()
+
+        if prob < fixer_prob:
+
+            cuda = torch.cuda.is_available()
+            os.makedirs(AUG_PATH + row['speaker'], exist_ok=True)
+            voice_fixer.restore(input=os.path.join(DIR_PATH, f"{row['speaker']}/{row['file']}"),
+                                output=os.path.join(AUG_PATH, f"{row['speaker']}/{row['file'][:-4]}_voice.wav")
+                                , cuda=cuda, mode=0)
+            return {
+                'file': f"{row['file']}_voice.wav",
+                'speaker': row['speaker'],
+                'label': row['label']
+            }
+
+        audio, sr = librosa.load(f"{DIR_PATH}{row['speaker']}/{row['file']}", sr=None)
+        audio = composer(audio, sr)
+        os.makedirs(AUG_PATH + row['speaker'], exist_ok=True)
+        soundfile.write(os.path.join(AUG_PATH, f"{row['speaker']}/{row['file'][:-4]}_augmented.wav"), audio, samplerate=sr)
         return {
-            'file': f"augmented_{row['file']}",
+            'file': f"{row['file']}_augmented.wav",
             'speaker': row['speaker'],
-            'label': row['label'],
-            'audio': augmented
+            'label': row['label']
         }
 
     def balance_dataset(self, df, path):
@@ -104,29 +130,6 @@ class AudioBalancer:
         return pd.concat(balanced_dfs).reset_index(drop=True)
 
 
-class AudioDataset(Dataset):
-    def __init__(self, df, augment=False):
-        self.df = df
-        self.augment = augment
-
-    def __len__(self):
-        return len(self.df)
-
-    def __getitem__(self, idx):
-        row = self.df.iloc[idx]
-
-        if 'audio' not in row:  # Caricamento lazy per non aumentare la RAM
-            audio, sr = librosa.load(f"./release_in_the_wild/{row['file']}", sr=None)
-        else:
-            audio, sr = row['audio'], 22050
-
-        if self.augment and self.augmenter:
-            audio = self.augmenter(samples=audio, sample_rate=sr)
-
-        mfcc = librosa.feature.mfcc(y=audio, sr=sr, n_mfcc=13)
-        return torch.FloatTensor(mfcc), torch.tensor(row['label'])
-
-
 # Esempio di utilizzo
 if __name__ != "__main__":
     # Inizializzazione
@@ -137,16 +140,12 @@ if __name__ != "__main__":
     )
 
     # Caricamento dati
-    df = pd.read_csv('./processed_audio/chunkedDf.csv')
-    for i in range(len(df['label'])):
-        if df['label'][i] == 'spoof':
-            df.loc[i, 'label'] = 0
-        else:
-            df.loc[i, 'label'] = 1
-    #balanced_df = balancer.balance_dataset(df, DIR_PATH)
+    data = pd.read_csv(DIR_PATH + 'chunkedDf.csv')
 
-    # Salvataggio del dataset bilanciato
-    #balanced_df.to_csv('balanced_dataset.csv', index=False)
-    df.sort_values(by='speaker', ascending=True, inplace=True)
-    speaker = df['speaker'].unique()
-    train_speaker, test_speaker = train_test_split(speaker, test_size=0.2, random_state=42)
+    for _, row in data.iterrows():
+        if row['label'] == 'spoof':
+            row['label'] = 1
+        else :
+            row['label'] = 0
+
+    #balancer.augmentation(data)

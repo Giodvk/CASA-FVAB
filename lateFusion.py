@@ -1,45 +1,33 @@
 import logging
-import os
 from pathlib import Path
 import sys
 import numpy as np
 import pandas as pd
 import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader, Dataset
 import librosa
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import accuracy_score, classification_report, roc_auc_score, roc_curve
 import joblib
 from tqdm import tqdm
-from DataBalancingDeepSeek import train_speaker, test_speaker
+from split_dataset import train_speaker, test_speaker
 from DeepLearningModel import DeepfakeClassifier
-from ShallowLearningModel import extract_features
+from models.ShallowLearningModel import extract_features
 from dataAudio import AudioConfig, AudioProcessor
 
 # --- Configuration & Setup ---
 # Set your paths and parameters here
-DATA_ROOT_DIR = "/Users/salvatorebasilicata/Desktop/Magistrale/CASA-FVAB/processed_audio" # Root directory for audio chunks
-CSV_PATH = "/Users/salvatorebasilicata/Desktop/Magistrale/CASA-FVAB/processed_audio/chunkedDf.csv"       # Path to the directory containing chunkedDf.csv
-RESNET_MODEL_PATH = "best_model_deepfake.pth"
-RF_MODEL_PATH = "Random_Forest.pkl"
+DATA_ROOT_DIR = "./processed_audio"  # Root directory for audio chunks
+CSV_PATH = "./processed_audio/chunkedDf.csv"       # Path to the directory containing chunkedDf.csv
+RESNET_MODEL_PATH = "./saved_models/best_model_deepfake.pth"
+RF_MODEL_PATH = "./saved_models/Random_Forest.pkl"
 SCALER_PATH = "scaler.pkl"
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-# Assuming you have these pre-defined from your training scripts
-# Replace with your actual train/val/test speaker lists or dataframes
-# For this script, we'll assume test_metadata_df is what we want to evaluate on
-# You would typically have a separate validation set to find alpha
+
 full_metadata_df = pd.read_csv(CSV_PATH)
 
 train_metadata_df = full_metadata_df[full_metadata_df['speaker'].isin(train_speaker)].reset_index(drop=True)
 val_metadata_df = full_metadata_df[full_metadata_df['speaker'].isin(test_speaker)].reset_index(drop=True)
-
-# --- Model & Feature Extraction Definitions (Copied from your snippets) ---
-# NOTE: Make sure these class/function definitions match your training environment exactly.
-
 
 
 # --- Main Logic ---
@@ -167,9 +155,6 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    # For demonstration, setup a dummy environment.
-    # In your real workflow, you would just load your existing dataframes.
-
     # 1. Load models and processors
     audio_conf = AudioConfig()
     audio_processor = AudioProcessor(audio_conf)
@@ -215,6 +200,7 @@ def main():
     
     fused_probs = best_alpha * test_probs_resnet + (1 - best_alpha) * test_probs_rf
     results["Fused Model"] = evaluate_model(f"Fused Model (alpha={best_alpha:.2f})", test_y_true, fused_probs, best_threshold)
+
     
     # 6. Display summary
     print("\n--- PERFORMANCE SUMMARY ---\n")

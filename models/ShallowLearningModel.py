@@ -4,8 +4,14 @@ import pandas as pd
 import librosa.feature
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import StandardScaler
-from DataBalancingDeepSeek import train_speaker, test_speaker, DIR_PATH
+from split_dataset import train_speaker, test_speaker
+from sklearn.model_selection import GridSearchCV
 from sklearn.metrics import accuracy_score, recall_score, roc_auc_score, classification_report
+
+DIR_PATH = "C:\\Users\dmc\PycharmProjects\CASA-FVAB\processed_audio\chunkedDf.csv"
+
+params_rf = {'n_estimators': [200, 210, 230, 300, 400], 'max_depth': [7, 8, 9, 10, 11, 12], 'random_state': [42]}
+
 
 AUDIO_FEATURES = [
     'zcr', 'rmse', 'mfcc', 'spectral_centroid',
@@ -58,11 +64,16 @@ def train_and_evaluate(train_df: pd.DataFrame, test_df: pd.DataFrame):
     X_test_scaled = scaler.transform(X_test)
 
     # Modello
-    clf = RandomForestClassifier(n_estimators=210, max_depth=10, random_state=42)
-    clf.fit(X_train_scaled, y_train)
+    clf = RandomForestClassifier()
 
-    y_pred = clf.predict(X_test_scaled)
-    y_prob = clf.predict_proba(X_test_scaled)[:, 1] if hasattr(clf, "predict_proba") else None
+    search = GridSearchCV(estimator=clf, param_grid=params_rf, n_jobs=-1)
+
+    search.fit(X_train, y_train)
+    print(search.best_params_)
+    best_clf = search.best_estimator_
+
+    y_pred = best_clf.predict(X_test)
+    y_prob = best_clf.predict_proba(X_test)[:, 1] if hasattr(clf, "predict_proba") else None
 
     # Metriche
     print("Performance metrics:")
