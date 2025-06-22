@@ -3,7 +3,7 @@ from pathlib import Path
 import joblib
 import numpy as np
 import librosa
-from CreateCSVASVSpoof import df, ASVSpoofProcessor
+from cross_validation.Test_on_ASV import df, ASVSpoofProcessor
 from dataAudio import AudioConfig, AudioProcessor
 from lateFusion import evaluate_model, find_optimal_params
 from models.ShallowLearningModel import extract_features

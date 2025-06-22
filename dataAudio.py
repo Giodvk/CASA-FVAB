@@ -58,7 +58,7 @@ class AudioProcessor:
     def compute_mel(self, waveform: torch.Tensor) -> torch.Tensor:
         # waveform: (batch=1, time) or (batch, time)
         mel_power = self.melspec(waveform)      # -> (batch, n_mels, time_frames)
-        mel_db    = self.amplitude_to_db(mel_power)
+        mel_db = self.amplitude_to_db(mel_power)
         return mel_db
 
 
@@ -159,7 +159,7 @@ class DeepfakeDataset(torch.utils.data.Dataset): # Renamed from SpeakerDataset
             samples.append({
                 "path": audio_path,
                 "speaker": row['speaker'],
-                "label": self.label_map[row['label']] # Convert 'bona-fide'/'spoof' to 0/1
+                "label": self.label_map[row['label']]  # Convert 'bona-fide'/'spoof' to 0/1
             })
         return samples
 
