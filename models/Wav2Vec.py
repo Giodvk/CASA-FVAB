@@ -1,32 +1,41 @@
 import pandas as pd
 import torch
 import torchaudio
-from transformers import AutoProcessor, AutoModelForPreTraining
+from soundfile import LibsndfileError
+from transformers import Wav2Vec2Processor, AutoModelForPreTraining, AutoTokenizer, AutoFeatureExtractor
 import torch.nn as nn
 from split_dataset import train_speaker, test_speaker
 
+tokenizer = AutoTokenizer.from_pretrained('C:\\Users\dmc\PycharmProjects\CASA-FVAB\wav2vec2-xlsr',
+                                          local_files_only=True)
+feature_extractor = AutoFeatureExtractor.from_pretrained('C:\\Users\dmc\PycharmProjects\CASA-FVAB\wav2vec2-xlsr',
+                                                         local_files_only=True)
 
-processor = AutoProcessor.from_pretrained('facebook/wav2vec2-large-xlsr-53')
+processor = Wav2Vec2Processor.from_pretrained(
+    'C:\\Users\dmc\PycharmProjects\CASA-FVAB\wav2vec2-xlsr',
+                             local_files_only=True)
 
 
 class Wav2VecDataset(torch.utils.data.Dataset):
     def __init__(self, data_dir, df, speakers, processor):
         self.data_dir = data_dir
-        self.metadata = df[df['speaker'].isin(speakers)][['file', 'label']].reset_index(drop=True)
+        self.target_sr = 16000
+        self.metadata = df[df['speaker'].isin(speakers)].reset_index(drop=True)
         self.processor = processor
 
     def __getitem__(self, idx: int):
-        label_map = {'spoof': 1, 'bonafide': 0}
-        if idx > len(self):
+        label_map = {'spoof': 1, 'bona-fide': 0}
+        if idx > len(self.metadata):
             raise IndexError("Index out of bounds")
 
-        file = self.metadata.iloc(idx)['file']
+        file = self.metadata.iloc[idx]['file']
+        speaker = self.metadata.iloc[idx]['speaker'] + "\\"
         label = self.metadata.iloc[idx]['label']
 
         try:
-            waveform, sample_rate = torchaudio.load(self.data_dir + file, sr=None)
-        except Exception as e:
-            print(f"Errore nel caricamento del file {self.data_dir + file}")
+            waveform, sample_rate = torchaudio.load(self.data_dir + speaker + file)
+        except LibsndfileError as e:
+            print(f"Errore nel caricamento del file {self.data_dir + speaker + file}")
             return None, None
 
         if sample_rate != self.target_sr:
@@ -39,12 +48,10 @@ class Wav2VecDataset(torch.utils.data.Dataset):
         normalized_waveform = self.processor(waveform.squeeze(0).numpy(),
                                              sampling_rate=16000, return_tensors="pt").input_values
         label_num = label_map[label]
-
-        return normalized_waveform.unsqueeze(0), torch.tensor(label_num, dtype=torch.long)
+        return normalized_waveform.squeeze(0), torch.tensor(label_num, dtype=torch.long)
 
     def __len__(self):
         return len(self.metadata)
-
 
 
 
@@ -53,21 +60,23 @@ class Wav2VecClassifier(nn.Module):
 
         super(Wav2VecClassifier, self).__init__()
 
-        self.wav2vec_model = AutoModelForPreTraining.from_pretrained("facebook/wav2vec2-large-xlsr-53")
+        self.wav2vec_model = AutoModelForPreTraining.from_pretrained(
+            'C:\\Users\dmc\PycharmProjects\CASA-FVAB\wav2vec2-xlsr',
+                                          local_files_only=True)
 
-        for param in self.wav2vec2_model.parameters():
+        for param in self.wav2vec_model.parameters():
             param.required_grad = False
 
         self.classifier = nn.Sequential(
-            nn.Linear(self.wav2vec2_model.config.hidden_size, hidden_dim),
+            nn.Linear(self.wav2vec_model.config.hidden_size, hidden_dim),
             nn.ReLU(),
             nn.Dropout(.3),
             nn.Linear(hidden_dim, num_classes)
         )
 
     def forward(self, x):
-        wav_embeddings = self.wav2vec_model(x).last_hidden_state
-        pooled = wav_embeddings.mean(dim=1)
+        wav_embeddings = self.wav2vec_model(x, output_hidden_states=True).hidden_states[-1]
+        pooled = torch.mean(wav_embeddings, dim=1)
         return self.classifier(pooled)
 
 
@@ -98,7 +107,6 @@ def evaluate(model, valid_loader, loss_fn, device):
             x, y = x.to(device), y.to(device)
             output = model(x)
             loss = loss_fn(output, y)
-            loss.backward()
 
             total_loss += loss.item() * len(y)
             total_acc += (output.argmax(dim=1) == y).sum().item()
@@ -111,14 +119,14 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     wav2vec_model = Wav2VecClassifier()
-    data_frame = pd.read_csv("C:\\Users\dmc\PycharmProjects\CASA-FVAB\meta.csv")
-    train_dataset = Wav2VecDataset("C:\\Users\dmc\PycharmProjects\CASA-FVAB\\release_in_the_wild",
+    data_frame = pd.read_csv("C:\\Users\dmc\PycharmProjects\CASA-FVAB\processed_audio\chunkedDf.csv")
+    train_dataset = Wav2VecDataset("C:\\Users\dmc\PycharmProjects\CASA-FVAB\\processed_audio\\",
                                    data_frame, train_speaker, processor)
-    valid_dataset = Wav2VecDataset("C:\\Users\dmc\PycharmProjects\CASA-FVAB\\release_in_the_wild",
+    valid_dataset = Wav2VecDataset("C:\\Users\dmc\PycharmProjects\CASA-FVAB\\processed_audio\\",
                                    data_frame, test_speaker, processor)
 
-    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=64, shuffle=True)
-    valid_loader = torch.utils.data.DataLoader(valid_dataset, batch_size=64, shuffle=True)
+    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=8, shuffle=True)
+    valid_loader = torch.utils.data.DataLoader(valid_dataset, batch_size=8, shuffle=False)
 
     wav2vec_model.to(device)
     num_epoch = 50
@@ -139,7 +147,7 @@ def main():
 
           if val_loss < best_val_loss:
               best_val_loss = val_loss
-              torch.save(wav2vec_model.state_dict(), '..saved_models/wav2vec_model.pth')
+              torch.save(wav2vec_model.state_dict(), '../saved_models/wav2vec_model.pth')
               print("Saved best model")
           else:
               patience += 1

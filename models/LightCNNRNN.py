@@ -4,12 +4,12 @@ import torch.nn as nn
 import pandas as pd
 from torch import optim
 
+import ASVSpoofDataset
 from DeepLearningModel import DeepfakeDataset, AudioProcessor, AudioConfig
+from ASVSpoofDataset import ASVspoofDataset, ASVSpoofProcessor
 from split_dataset import train_speaker, test_speaker
 from light_cnn import network_29layers_v2, resblock
-
-
-DIR_PATH = Path('C:\\Users\dmc\PycharmProjects\CASA-FVAB\processed_audio\chunkedDf.csv')
+from sklearn.model_selection import train_test_split
 
 
 class ModifiedLightCNN(network_29layers_v2):
@@ -46,7 +46,6 @@ class LightCNNRNN(nn.Module):
             nn.Dropout(p=0.3),
             nn.Linear(rnn_hidden_size, 2)
         )
-
 
     def forward(self, x):
         # 1. Passa attraverso la CNN
@@ -85,7 +84,7 @@ def train(model, train_loader, criterion, device, optimizer):
     model.train()
     total_loss, total_correct, total_samples = 0.0, 0, 0
     for x, y in train_loader:
-        mel_spectrograms = x['mel'].to(device)
+        mel_spectrograms = x.to(device)
         labels = y.to(device)
         output = model(mel_spectrograms)
         loss = criterion(output, labels)
@@ -107,7 +106,7 @@ def validate(model, valid_loader, criterion, device):
 
     with torch.no_grad():
         for x, y in valid_loader:
-            mel_spectrograms = x['mel'].to(device)
+            mel_spectrograms = x.to(device)
             labels = y.to(device)
             mel_spectrograms = mel_spectrograms.unsqueeze(1)
             output = model(mel_spectrograms)
@@ -120,8 +119,7 @@ def validate(model, valid_loader, criterion, device):
     return total_loss / total_samples, total_correct / total_samples
 
 
-
-def prepare_loader(samples: pd.DataFrame, train_speakers: pd.DataFrame, valid_speakers: pd.DataFrame,
+def prepare_loader_In_The_Wild(source_path: str, samples: pd.DataFrame, train_speakers: pd.DataFrame, valid_speakers: pd.DataFrame,
                    batch_size: int = 64):
     config = AudioConfig()
     processor = AudioProcessor(config)
@@ -130,24 +128,51 @@ def prepare_loader(samples: pd.DataFrame, train_speakers: pd.DataFrame, valid_sp
     valid_speakers = samples[samples['speaker'].isin(valid_speakers)].reset_index(drop=True)
     weights = compute_loss_weight(train_speakers)
 
-    train_dataset = DeepfakeDataset(Path("C:\\Users\dmc\PycharmProjects\CASA-FVAB\processed_audio"), train_speakers, processor)
-    valid_dataset = DeepfakeDataset(Path("C:\\Users\dmc\PycharmProjects\CASA-FVAB\processed_audio"), valid_speakers, processor)
+    train_dataset = DeepfakeDataset(Path(source_path), train_speakers, processor)
+    valid_dataset = DeepfakeDataset(Path(source_path), valid_speakers, processor)
 
     train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     valid_loader = torch.utils.data.DataLoader(valid_dataset, batch_size=batch_size, shuffle=False)
 
     return train_loader, valid_loader, weights
 
+def prepare_loader_ASV(source_path: str, train_dataset: ASVSpoofDataset, valid_dataset: ASVSpoofDataset,
+                       batch_size: int =64):
+    config = AudioConfig()
+    processor = ASVSpoofProcessor(config)
+
+    asv_train = ASVspoofDataset(source_path, train_dataset, 5, processor, mode='train')
+    asv_valid = ASVspoofDataset(source_path, valid_dataset, 5, processor, mode='eval')
+
+    train_loader = torch.utils.data.DataLoader(asv_train, batch_size=batch_size, shuffle=True)
+    valid_loader = torch.utils.data.DataLoader(asv_valid, batch_size=batch_size, shuffle=False)
+
+    return train_loader, valid_loader
 
 def main():
-    df = pd.read_csv(DIR_PATH)
+    print("Decidere Dataset d'allenamento: 0 (In_The_Wild), 1 (ASVspoof2021)")
+
+    choice = int(input())
+
+    print("Inserire il path dei file sorgenti e dei metadati: ")
+    source_path, df_path = input().split(" ")
+
+    df = pd.read_csv(df_path)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     model = LightCNNRNN().to(device)
     torch.compile(model)
     optimizer = optim.Adam(model.parameters(), lr=1e-4)
 
-    train_loader, valid_loader, pos_weight = prepare_loader(df, train_speaker, valid_speakers=test_speaker, batch_size=128)
+    match choice:
+        case 0:
+            train_loader, valid_loader, pos_weight = prepare_loader_In_The_Wild(source_path, df, train_speaker,
+                                                                                valid_speakers=test_speaker, batch_size=64)
+        case 1:
+            train_dataset, valid_dataset = train_test_split(df[:152955], test_size=0.25, random_state=42)
+            train_loader, valid_loader = prepare_loader_ASV(source_path, train_dataset, valid_dataset, batch_size=64)
+        case _:
+            train_loader, valid_loader = None, None
     loss_fn = nn.CrossEntropyLoss()
 
     # Early stopping setup
@@ -157,6 +182,10 @@ def main():
     best_epoch = -1
 
     num_epochs = 50
+    if train_loader is None or valid_loader is None:
+        print("Dataset non forniti correttamente")
+        return
+
     for epoch in range(1, num_epochs + 1):
         print(f"\nEpoch {epoch}/{num_epochs}")
         train_loss, train_acc = train(model, train_loader, loss_fn, device, optimizer)

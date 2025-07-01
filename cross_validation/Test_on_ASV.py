@@ -10,6 +10,7 @@ from ASVSpoofDataset import ASVspoofDataset, calculate_eer, CreateCSVASVSpoof, A
 import torch
 
 from models.LightCNNRNN import LightCNNRNN
+from models.Wav2Vec import Wav2VecClassifier
 
 
 def testOnASVspoof(model,
@@ -136,8 +137,8 @@ if __name__ == '__main__':
     df.to_csv("ASVSpoofData.csv", index=False, columns=['file', 'label'])
     config = AudioConfig()
     processor = ASVSpoofProcessor(config=config, target=5)
-    cnn_rnn = LightCNNRNN().to(device="cuda")
-    cnn_rnn.load_state_dict(torch.load("C:/Users/dmc/PycharmProjects/CASA-FVAB/models/best_model.pth",
+    cnn_rnn = Wav2VecClassifier().to(device="cuda")
+    cnn_rnn.load_state_dict(torch.load("C:/Users/dmc/PycharmProjects/CASA-FVAB/saved_models/wav2vec_model.pth",
                                        map_location="cuda"))
     prova = df[:152956]
     spoof = prova[prova['label'] == 'spoof']

@@ -5,7 +5,7 @@ import torch
 from cross_validation.Test_on_ASV import df, ASVSpoofProcessor
 from tqdm import tqdm
 import librosa
-from models.ShallowLearningModel import extract_features
+from models.RandomForest import extract_features
 from models.LightCNNRNN import LightCNNRNN
 from dataAudio import AudioProcessor, AudioConfig
 

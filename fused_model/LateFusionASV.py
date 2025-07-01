@@ -6,7 +6,7 @@ import librosa
 from cross_validation.Test_on_ASV import df, ASVSpoofProcessor
 from dataAudio import AudioConfig, AudioProcessor
 from lateFusion import evaluate_model, find_optimal_params
-from models.ShallowLearningModel import extract_features
+from models.RandomForest import extract_features
 from DeepLearningModel import DeepfakeClassifier
 import pandas as pd
 import torch

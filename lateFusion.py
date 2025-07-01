@@ -10,13 +10,13 @@ import joblib
 from tqdm import tqdm
 from split_dataset import train_speaker, test_speaker
 from DeepLearningModel import DeepfakeClassifier
-from models.ShallowLearningModel import extract_features
+from models.RandomForest import extract_features
 from dataAudio import AudioConfig, AudioProcessor
 
 # --- Configuration & Setup ---
 # Set your paths and parameters here
 DATA_ROOT_DIR = "./processed_audio"  # Root directory for audio chunks
-CSV_PATH = "./processed_audio/chunkedDf.csv"       # Path to the directory containing chunkedDf.csv
+CSV_PATH = "C:\\Users\dmc\PycharmProjects\CASA-FVAB\processed_audio\chunkedDf.csv"       # Path to the directory containing chunkedDf.csv
 RESNET_MODEL_PATH = "./saved_models/best_model_deepfake.pth"
 RF_MODEL_PATH = "./saved_models/Random_Forest.pkl"
 SCALER_PATH = "scaler.pkl"

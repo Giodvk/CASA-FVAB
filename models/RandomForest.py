@@ -5,13 +5,10 @@ import librosa.feature
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import StandardScaler
 from split_dataset import train_speaker, test_speaker
-from sklearn.model_selection import GridSearchCV
+from sklearn.model_selection import GridSearchCV, train_test_split
 from sklearn.metrics import accuracy_score, recall_score, roc_auc_score, classification_report
 
-DIR_PATH = "C:\\Users\dmc\PycharmProjects\CASA-FVAB\processed_audio\chunkedDf.csv"
-
 params_rf = {'n_estimators': [200, 210, 230, 300, 400], 'max_depth': [7, 8, 9, 10, 11, 12], 'random_state': [42]}
-
 
 AUDIO_FEATURES = [
     'zcr', 'rmse', 'mfcc', 'spectral_centroid',
@@ -30,7 +27,7 @@ def extract_features(audio: np.ndarray, sr: int) -> dict:
         'chroma': librosa.feature.chroma_stft(y=audio, sr=sr).mean()
     }
 
-def prepare_data(speakers: np.ndarray, path: str, csv_path: str) -> pd.DataFrame:
+def prepare_data_wild(speakers: np.ndarray, path: str, csv_path: str) -> pd.DataFrame:
     """Prepara il dataset estraendo feature audio dai file specificati."""
     df = pd.read_csv(os.path.join(csv_path, "chunkedDf.csv"))
     data = []
@@ -42,11 +39,22 @@ def prepare_data(speakers: np.ndarray, path: str, csv_path: str) -> pd.DataFrame
             audio, sr = librosa.load(file_path, sr=None)
             features = extract_features(audio, sr)
             features.update({
-                'file': row['file'],
-                'speaker': speaker,
                 'label': row['label']
             })
             data.append(features)
+
+    return pd.DataFrame(data)
+
+def prepare_data_asv(path: str, csv_path: str) -> pd.DataFrame:
+    df = pd.read_csv(os.path.join(csv_path, "ASVSpoofData.csv"))
+    data = []
+
+    for _, row in df.iterrows():
+        file_path = os.path.join(path, row['file'])
+        audio, sr = librosa.load(file_path)
+        features = extract_features(audio, sr)
+        features.update({'label': row['label']})
+        data.append(features)
 
     return pd.DataFrame(data)
 
@@ -55,8 +63,8 @@ def train_and_evaluate(train_df: pd.DataFrame, test_df: pd.DataFrame):
     y_train = train_df.pop('label')
     y_test = test_df.pop('label')
 
-    X_train = train_df.drop(columns=['file', 'speaker'])
-    X_test = test_df.drop(columns=['file', 'speaker'])
+    X_train = train_df
+    X_test = test_df
 
     # Feature scaling (opzionale ma utile per modelli diversi)
     scaler = StandardScaler()
@@ -68,12 +76,12 @@ def train_and_evaluate(train_df: pd.DataFrame, test_df: pd.DataFrame):
 
     search = GridSearchCV(estimator=clf, param_grid=params_rf, n_jobs=-1)
 
-    search.fit(X_train, y_train)
+    search.fit(X_train_scaled, y_train)
     print(search.best_params_)
     best_clf = search.best_estimator_
 
-    y_pred = best_clf.predict(X_test)
-    y_prob = best_clf.predict_proba(X_test)[:, 1] if hasattr(clf, "predict_proba") else None
+    y_pred = best_clf.predict(X_test_scaled)
+    y_prob = best_clf.predict_proba(X_test_scaled)[:, 1] if hasattr(clf, "predict_proba") else None
 
     # Metriche
     print("Performance metrics:")
@@ -87,6 +95,21 @@ def train_and_evaluate(train_df: pd.DataFrame, test_df: pd.DataFrame):
 
 # === ESECUZIONE ===
 if __name__ == "__main__":
-    train_df = prepare_data(train_speaker, DIR_PATH, DIR_PATH)
-    test_df = prepare_data(test_speaker, DIR_PATH, DIR_PATH)
-    train_and_evaluate(train_df, test_df)
+    print("Decidere Dataset d'addestramento: 0 (In_The_Wild), 1 (ASVspoof2021)")
+
+    choice = int(input())
+
+    print("Inserire il path dei metadati: ")
+
+    source, csv = input().split(" ")
+
+    match choice:
+        case 0:
+            train_df = prepare_data_wild(train_speaker, source, csv)
+            test_df = prepare_data_wild(test_speaker, source, csv)
+            train_and_evaluate(train_df, test_df)
+        case 1:
+            df = prepare_data_asv(source, csv)
+            train_df, test_df = train_test_split(df, test_size=0.25, random_state=42)
+            train_and_evaluate(train_df, test_df)
+
