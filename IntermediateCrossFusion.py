@@ -1,14 +1,16 @@
 import logging
 from typing import List, Optional, Dict, Tuple
-from Data_balancing_In_The_Wild import train_speaker, test_speaker
-
+from split_dataset import train_speaker, test_speaker
+from transformers import Wav2Vec2Model
+import argparse
+from pathlib import Path
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 from scipy.optimize import brentq
 from scipy.interpolate import interp1d
 from sklearn.metrics import roc_curve, precision_recall_fscore_support
-from transformers import Wav2Vec2Model
 
 from dataAudio import AudioConfig, AudioProcessor, DeepfakeDataset
 
@@ -36,7 +38,6 @@ if torch.cuda.is_available():
 
 else:
     device = torch.device("cpu")
-print(f"--- Utilizzo del dispositivo: {device} ---")
 
 # ===================================================================
 #  1. Core Building Blocks for the Collaborative Network
@@ -418,7 +419,7 @@ def train_collaborative(
         metrics["train_loss"].append(avg_epoch_train_loss)
 
         if val_loader:
-            val_results = evaluate_collaborative(model, val_loader, criterion, device)
+            val_results = evaluate_collaborative(model, val_loader, criterion)
             metrics["val_loss"].append(val_results["loss"])
             metrics["val_acc"].append(val_results["acc"])
             metrics["val_precision"].append(val_results["precision"])
@@ -491,11 +492,6 @@ def evaluate_collaborative(
     }
 
 
-
-
-
-
-
 def main():
     parser = argparse.ArgumentParser(description="Multi-View Collaborative Training for Deepfake Detection")
 
@@ -532,7 +528,6 @@ def main():
 
     # --- Load and Split Metadata ---
     logger.info("--- Loading and Splitting Metadata ---")
-    full_metadata_df = pd.read_csv(args.metadata_path)
     full_metadata_df = pd.read_csv(args.metadata_path)
     if full_metadata_df.empty:
         logger.error(f"Metadata CSV file at {args.metadata_path} is empty. Exiting.")
