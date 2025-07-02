@@ -13,7 +13,7 @@ from scipy.optimize import brentq
 from scipy.interpolate import interp1d
 
 from dataAudio import AudioConfig, AudioProcessor, DeepfakeDataset
-from DataBalancingDeepSeek import train_speaker, test_speaker
+from split_dataset import train_speaker, test_speaker
 
 
 logger = logging.getLogger(__name__)

@@ -14,7 +14,7 @@ from pathlib import Path
 import pandas as pd
 import os
 from typing import List, Tuple, Optional
-from DataBalancingDeepSeek import train_speaker, test_speaker
+from split_dataset import train_speaker, test_speaker
 from DeepLearningModel import DeepfakeClassifier, AudioConfig, AudioProcessor, DeepfakeDataset, collate_fn_skip_none
 
 

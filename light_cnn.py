@@ -168,7 +168,6 @@ class network_29layers_v2(nn.Module):
         return out, fc
 
     def features(self, x):
-        x = x.unsqueeze(1)
         x = self.conv1(x)
         x = F.max_pool2d(x, (2, 1), stride=(2, 1)) + F.avg_pool2d(x, (2, 1), stride=(2, 1))
 

@@ -18,7 +18,6 @@ import pandas as pd
 import os
 from typing import List, Tuple, Optional
 from AdversarialAugmentation import AdversarialRefiner, RegionReconstructor, CriticalMaskGenerator, evaluate_detector_performance, evaluate_mask_generator_performance, find_adversarial_mask_gradient_based, train_epoch_critical_mask_generator, evaluate_adversarial_refiner_performance, visualize_masked_pair
-from DataBalancingDeepSeek import train_speaker, test_speaker
 from DeepLearningModel import DeepfakeClassifier, AudioConfig, AudioProcessor, DeepfakeDataset, collate_fn_skip_none
 
 # --- Main Co-Training Pipeline ---

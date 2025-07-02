@@ -4,12 +4,12 @@ import torch.nn as nn
 import pandas as pd
 from torch import optim
 
+import ASVSpoofDataset
 from DeepLearningModel import DeepfakeDataset, AudioProcessor, AudioConfig
-from DataBalancingDeepSeek import train_speaker, test_speaker
+from ASVSpoofDataset import ASVspoofDataset, ASVSpoofProcessor
+from split_dataset import train_speaker, test_speaker
 from light_cnn import network_29layers_v2, resblock
-
-
-DIR_PATH = Path('./processed_audio/chunkedDf.csv')
+from sklearn.model_selection import train_test_split
 
 
 class ModifiedLightCNN(network_29layers_v2):
@@ -18,6 +18,8 @@ class ModifiedLightCNN(network_29layers_v2):
     dell'ultimo blocco convoluzionale, prima dei layer Fully Connected.
     """
     def forward(self, x):
+        if len(x.shape) != 4:
+            x = x.unsqueeze(1)
         # Passaggi presi dal forward originale, ma fermati prima di fc1
         x = self.features(x)
         # L'output di self.features è l'output dell'ultimo blocco conv
@@ -38,7 +40,12 @@ class LightCNNRNN(nn.Module):
                           bidirectional=True, dropout=0.3,
                           num_layers=2, batch_first=True)
         # Multy Layer Perceptron
-        self.classifier = nn.Linear(rnn_hidden_size * 2, 1)
+        self.classifier = nn.Sequential(
+            nn.Linear(rnn_hidden_size*2, rnn_hidden_size),
+            nn.ReLU(),
+            nn.Dropout(p=0.3),
+            nn.Linear(rnn_hidden_size, 2)
+        )
 
     def forward(self, x):
         # 1. Passa attraverso la CNN
@@ -56,78 +63,63 @@ class LightCNNRNN(nn.Module):
 
 
 def compute_loss_weight(sample: pd.DataFrame) -> torch.Tensor:
-    spoof = sample[sample['label'] == 'spoof']
-    bona_fide = sample[sample['label'] == 'bona-fide']
+    count_bonafide = (sample['label'] == 'bona-fide').sum()
+    count_spoof = (sample['label'] == 'spoof').sum()
+    total = count_bonafide + count_spoof
 
-    pos_weight = len(bona_fide) / len(spoof)
+    weight_bonafide = total / (2.0 * count_bonafide)
+    weight_spoof = total / (2.0 * count_spoof)
 
-    return torch.tensor(pos_weight)
+    weights = torch.tensor([weight_bonafide, weight_spoof], dtype=torch.float)
+    return weights
 
 
 def get_batch_accuracy(output, label):
-    probabilities = torch.sigmoid(output)
-
-    pred = (probabilities > 0.5).long()
-
+    pred = output.argmax(dim=1)
     correct = (pred == label).sum().item()
-
     return correct
 
-def train(model: LightCNNRNN, train_loader: torch.utils.data.DataLoader, criterion: torch.nn.BCEWithLogitsLoss,
-          device: torch.device, optimizer: torch.optim.Optimizer):
+
+def train(model, train_loader, criterion, device, optimizer):
     model.train()
-    accuracy = 0.0
-    loss = 0.0
-    total_samples = 0
+    total_loss, total_correct, total_samples = 0.0, 0, 0
     for x, y in train_loader:
-        # Prepara i dati
-        mel_spectrograms = x['mel'].to(device)
+        mel_spectrograms = x.to(device)
         labels = y.to(device)
-        # Forward pass
         output = model(mel_spectrograms)
-        # Calcola la loss
-        batch_loss = criterion(output, labels.float().unsqueeze(1))
-        # Backward pass e ottimizzazione
+        loss = criterion(output, labels)
+
         optimizer.zero_grad()
-        batch_loss.backward()
+        loss.backward()
         optimizer.step()
 
-        # Aggiorna le metriche
-        loss += batch_loss.item() * len(labels)  # Pesa la loss per la dimensione del batch
-        accuracy += get_batch_accuracy(output, labels.unsqueeze(1))
+        total_loss += loss.item() * len(labels)
+        total_correct += get_batch_accuracy(output, labels)
         total_samples += len(labels)
 
-    epoch_loss = loss / total_samples
-    epoch_accuracy = accuracy / total_samples
-    print('Train Loss: {:.4f}, Train Accuracy: {:.4f}'.format(epoch_loss, epoch_accuracy))
+    return total_loss / total_samples, total_correct / total_samples
 
 
 def validate(model, valid_loader, criterion, device):
     model.eval()
-
-    total_loss = 0.0
-    total_correct = 0
-    total_samples = 0
+    total_loss, total_correct, total_samples = 0.0, 0, 0
 
     with torch.no_grad():
         for x, y in valid_loader:
-            mel_spectrograms = x['mel'].to(device)
+            mel_spectrograms = x.to(device)
             labels = y.to(device)
-
+            mel_spectrograms = mel_spectrograms.unsqueeze(1)
             output = model(mel_spectrograms)
-            loss = criterion(output, labels.float().unsqueeze(1))
+            loss = criterion(output, labels)
 
             total_loss += loss.item() * len(labels)
-            total_correct += get_batch_accuracy(output, labels.unsqueeze(1))
+            total_correct += get_batch_accuracy(output, labels)
             total_samples += len(labels)
 
-    epoch_loss = total_loss / total_samples
-    epoch_accuracy = total_correct / total_samples
-    print('Valid Loss: {:.4f}, Valid Accuracy: {:.4f}'.format(epoch_loss, epoch_accuracy))
+    return total_loss / total_samples, total_correct / total_samples
 
 
-
-def prepare_loader(samples: pd.DataFrame, train_speakers: pd.DataFrame, valid_speakers: pd.DataFrame,
+def prepare_loader_In_The_Wild(source_path: str, samples: pd.DataFrame, train_speakers: pd.DataFrame, valid_speakers: pd.DataFrame,
                    batch_size: int = 64):
     config = AudioConfig()
     processor = AudioProcessor(config)
@@ -136,32 +128,88 @@ def prepare_loader(samples: pd.DataFrame, train_speakers: pd.DataFrame, valid_sp
     valid_speakers = samples[samples['speaker'].isin(valid_speakers)].reset_index(drop=True)
     weights = compute_loss_weight(train_speakers)
 
-    train_dataset = DeepfakeDataset(Path("./processed_audio"), train_speakers, processor)
-    valid_dataset = DeepfakeDataset(Path("./processed_audio"), valid_speakers, processor)
+    train_dataset = DeepfakeDataset(Path(source_path), train_speakers, processor)
+    valid_dataset = DeepfakeDataset(Path(source_path), valid_speakers, processor)
 
     train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     valid_loader = torch.utils.data.DataLoader(valid_dataset, batch_size=batch_size, shuffle=False)
 
     return train_loader, valid_loader, weights
 
+def prepare_loader_ASV(source_path: str, train_dataset: ASVSpoofDataset, valid_dataset: ASVSpoofDataset,
+                       batch_size: int =64):
+    config = AudioConfig()
+    processor = ASVSpoofProcessor(config)
+
+    asv_train = ASVspoofDataset(source_path, train_dataset, 5, processor, mode='train')
+    asv_valid = ASVspoofDataset(source_path, valid_dataset, 5, processor, mode='eval')
+
+    train_loader = torch.utils.data.DataLoader(asv_train, batch_size=batch_size, shuffle=True)
+    valid_loader = torch.utils.data.DataLoader(asv_valid, batch_size=batch_size, shuffle=False)
+
+    return train_loader, valid_loader
 
 def main():
-    df = pd.read_csv(DIR_PATH)
+    print("Decidere Dataset d'allenamento: 0 (In_The_Wild), 1 (ASVspoof2021)")
+
+    choice = int(input())
+
+    print("Inserire il path dei file sorgenti e dei metadati: ")
+    source_path, df_path = input().split(" ")
+
+    df = pd.read_csv(df_path)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = LightCNNRNN()
-    model.to(device)
+
+    model = LightCNNRNN().to(device)
     torch.compile(model)
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
-    train_loader, valid_loader, pos_weight = prepare_loader(df, train_speaker, valid_speakers=test_speaker, batch_size=64)
-    loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    optimizer = optim.Adam(model.parameters(), lr=1e-4)
 
-    num_epochs = 20
+    match choice:
+        case 0:
+            train_loader, valid_loader, pos_weight = prepare_loader_In_The_Wild(source_path, df, train_speaker,
+                                                                                valid_speakers=test_speaker, batch_size=64)
+        case 1:
+            train_dataset, valid_dataset = train_test_split(df[:152955], test_size=0.25, random_state=42)
+            train_loader, valid_loader = prepare_loader_ASV(source_path, train_dataset, valid_dataset, batch_size=64)
+        case _:
+            train_loader, valid_loader = None, None
+    loss_fn = nn.CrossEntropyLoss()
 
-    for i in range(num_epochs):
-        print("Epoch : {}".format(i + 1))
-        train(model, train_loader, loss_fn, device, optimizer)
-        validate(model, valid_loader, loss_fn, device)
-    torch.save(model, "LightCNNRNN.pth")
+    # Early stopping setup
+    best_val_loss = float('inf')
+    patience = 30
+    patience_counter = 0
+    best_epoch = -1
+
+    num_epochs = 50
+    if train_loader is None or valid_loader is None:
+        print("Dataset non forniti correttamente")
+        return
+
+    for epoch in range(1, num_epochs + 1):
+        print(f"\nEpoch {epoch}/{num_epochs}")
+        train_loss, train_acc = train(model, train_loader, loss_fn, device, optimizer)
+        val_loss, val_acc = validate(model, valid_loader, loss_fn, device)
+
+        print(f"Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f}")
+        print(f"Valid Loss: {val_loss:.4f} | Valid Acc: {val_acc:.4f}")
+
+        # Check if validation loss improved
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            patience_counter = 0
+            best_epoch = epoch
+            torch.save(model.state_dict(), "best_model.pth")
+            print("Saved best model")
+        else:
+            patience_counter += 1
+            print(f"Early stopping patience: {patience_counter}/{patience}")
+
+        if patience_counter >= patience:
+            print(f"\nEarly stopping at epoch {epoch}")
+            break
+
+    print(f"\n Best model at epoch {best_epoch} with val loss {best_val_loss:.4f}")
 
 
 if __name__ == "__main__":

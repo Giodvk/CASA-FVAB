@@ -1,64 +1,25 @@
-import os
 from pathlib import Path
-import pandas as pd
+
 import numpy as np
-import torch
-from pydub import AudioSegment
+import pandas as pd
+from sklearn.metrics import accuracy_score, roc_auc_score, classification_report
 from torch.utils.data import DataLoader
-from DeepLearningModelRESNET import AudioConfig, AudioProcessor, DeepfakeDataset, DeepfakeClassifier
-from sklearn.metrics import accuracy_score, roc_auc_score, roc_curve, classification_report
+from dataAudio import AudioConfig
+from ASVSpoofDataset import ASVspoofDataset, calculate_eer, CreateCSVASVSpoof, ASVSpoofProcessor
+
+import torch
+
+from models.LightCNNRNN import LightCNNRNN
+from models.Wav2Vec import Wav2VecClassifier
 
 
-class ASVSpoofProcessor(AudioProcessor):
-
-    def __init__(self, config):
-        super(ASVSpoofProcessor, self).__init__(config)
-
-    def extract_features(self, waveform: torch.Tensor, target_sample_rate=16000, target_duration=5):
-        current_num_samples = waveform.shape[0]
-        target_num_samples = int(target_duration * target_sample_rate)
-        if current_num_samples == target_num_samples:
-            # Già della lunghezza corretta
-            processed_waveform = waveform
-        elif current_num_samples > target_num_samples:
-            # Audio più lungo: applica il ritaglio centrale (center cropping)
-            start_sample = (current_num_samples - target_num_samples) // 2
-            processed_waveform = waveform[:, start_sample: start_sample + target_num_samples]
-        else:  # current_num_samples < target_num_samples
-            # Audio più corto: applica il padding con silenzio alla fine
-            padding_needed = target_num_samples - current_num_samples
-            processed_waveform = torch.nn.functional.pad(waveform, (0, padding_needed))
-        return super(ASVSpoofProcessor, self).extract_features(processed_waveform)
-
-
-
-# ----------------------------------------------------------------------------
-# FUNZIONE PER CALCOLARE L'EQUAL ERROR RATE (EER)
-# ----------------------------------------------------------------------------
-def calculate_eer(y_true, y_scores_positive_class):
-    """
-    Calcola l'Equal Error Rate (EER).
-    y_true: Etichette binarie vere (0 o 1).
-    y_scores_positive_class: Score del modello per la classe positiva (es. 'spoof').
-    """
-    fpr, tpr, thresholds = roc_curve(y_true, y_scores_positive_class, pos_label=1)  # Assumiamo 1 = spoof
-    fnr = 1 - tpr
-    eer_index = np.nanargmin(np.abs(fnr - fpr))
-    eer_value = (fpr[eer_index] + fnr[eer_index]) / 2
-    return eer_value * 100  # Riportato come percentuale
-
-
-# ----------------------------------------------------------------------------
-# FUNZIONE PRINCIPALE DI TEST
-# ----------------------------------------------------------------------------
 def testOnASVspoof(model,
                    asv_csv_path,
                    audio_root_dir,
                    audioProcessor,
                    batch_size=64,
                    label_mapping=None,
-
-                    ):
+                   ):
     """
     Valuta un modello PyTorch su un sottoinsieme di ASVspoof.
     """
@@ -74,15 +35,16 @@ def testOnASVspoof(model,
 
         idx_to_label_name = {v: k for k, v in current_label_mapping.items()}
         report_target_names = [idx_to_label_name[i] for i in sorted(idx_to_label_name.keys())]
-    except Exception:
+    except RuntimeError:
         report_target_names = None  # Fallback
 
     # Crea Dataset e DataLoader
-    eval_dataset = DeepfakeDataset(
+    eval_dataset = ASVspoofDataset(
         root_dir=audio_root_dir,
-        metadata_df=asv_csv_path,
+        metadata_csv=asv_csv_path,
         processor=audioProcessor,
-        augment=False
+        target_duration=5,
+        mode="eval"
     )
 
     if len(eval_dataset) == 0:
@@ -101,9 +63,7 @@ def testOnASVspoof(model,
     print(f"Inizio valutazione su {len(eval_dataset)} campioni...")
     with torch.no_grad():  # Disabilita il calcolo dei gradienti
         for i, (batch_features, batch_true_labels) in enumerate(eval_dataloader):
-
-            model_outputs = model(batch_features['mel'].to(device))  # Output raw del modello (logits)
-
+            model_outputs = model(batch_features.to(device))  # Output raw del modello (logits)
 
             if model_outputs.ndim > 1 and model_outputs.shape[1] == 2:
                 probabilities = torch.softmax(model_outputs, dim=1)
@@ -167,63 +127,21 @@ def testOnASVspoof(model,
     return results
 
 
-def CreateCSVASVSpoof(pathKey):
-    data = []
-    label = {'bonafide': 'bona-fide', 'spoof': 'spoof'}
-    with open(pathKey,'r') as csvfile:
-        for line in csvfile.readlines():
-            df = {}
-            split_line = line.split(' ')
-            name_audio = split_line[1]
-            label_audio = label[split_line[5]]
-            df.update({'file': name_audio+".wav", 'label': label_audio})
-            data.append(df)
-    return pd.DataFrame(data)
-
-
-def convert_flac_to_wav_inplace(input_dir: Path):
-    input_dir = Path(input_dir)
-
-    for flac_file in input_dir.rglob("*.flac"):
-        try:
-            print(f"Converting: {flac_file}")
-            audio = AudioSegment.from_file(flac_file, format="flac")
-
-            wav_path = flac_file.with_suffix('.wav')
-            audio.export(wav_path, format="wav")
-
-            flac_file.unlink()  # rimuove il file .flac originale
-            print(f"✓ Converted and replaced: {flac_file.name}")
-        except Exception as e:
-            print(f"✗ Failed to convert {flac_file}: {e}")
-
 if __name__ == '__main__':
     eval_path = Path('B:/4835108/ASVspoof2021_DF_eval_part00/ASVspoof2021_DF_eval/flac')
-    pathKey = './trial_metadata.txt'
+    pathKey = 'C:/Users/dmc/PycharmProjects/CASA-FVAB/trial_metadata.txt'
 
-    #convert_flac_to_wav_inplace(eval_path)
+    # convert_flac_to_wav_inplace(eval_path)
 
     df = CreateCSVASVSpoof(pathKey)
     df.to_csv("ASVSpoofData.csv", index=False, columns=['file', 'label'])
-    modelPath = 'best_hardened_detector.pth'
-    modelArchitecture = DeepfakeClassifier()
-    state_dict = torch.load(modelPath, map_location=torch.device('cuda'), weights_only=False)
-    modelArchitecture.load_state_dict(state_dict['model_state_dict'])
-    modelArchitecture.to(device="cuda")
     config = AudioConfig()
-    processor = ASVSpoofProcessor(config)
-    testOnASVspoof(
-        model=modelArchitecture,
-        asv_csv_path=df[:152956],
-        audio_root_dir=eval_path,
-        audioProcessor=processor
-    )
-
-
-
-
-
-
-
-
-
+    processor = ASVSpoofProcessor(config=config, target=5)
+    cnn_rnn = Wav2VecClassifier().to(device="cuda")
+    cnn_rnn.load_state_dict(torch.load("C:/Users/dmc/PycharmProjects/CASA-FVAB/saved_models/wav2vec_model.pth",
+                                       map_location="cuda"))
+    prova = df[:152956]
+    spoof = prova[prova['label'] == 'spoof']
+    bona = prova[prova['label'] == 'bona-fide']
+    final = pd.concat([bona, spoof[:5536]])
+    testOnASVspoof(cnn_rnn, final, eval_path, processor)
