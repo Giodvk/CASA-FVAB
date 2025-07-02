@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass
 import pandas as pd # Added for CSV reading
+from transformers import Wav2Vec2FeatureExtractor # <-- ADD THIS IMPORT
 
 
 logger = logging.getLogger(__name__)
@@ -24,7 +25,7 @@ class AudioConfig:
 
 
 class AudioProcessor:
-    def __init__(self, config: AudioConfig):
+    def __init__(self, config: AudioConfig, wav2vec_model_name: str = "facebook/wav2vec2-large-xls-r-300m"):
         self.config = config
         self.melspec = torchaudio.transforms.MelSpectrogram(
             sample_rate=config.sample_rate,
@@ -39,7 +40,12 @@ class AudioProcessor:
         self.amplitude_to_db = torchaudio.transforms.AmplitudeToDB(
             stype='power',             # convert power to dB
             top_db=80.0
-        )
+        )       
+        self.wav2vec_feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(wav2vec_model_name)
+        # Ensure the target sampling rate matches our config
+        if self.wav2vec_feature_extractor.sampling_rate != config.sample_rate:
+            raise ValueError(f"Wav2Vec processor expects sample rate {self.wav2vec_feature_extractor.sampling_rate}, "
+                             f"but config is set to {config.sample_rate}")
 
 
         self.mfcc_transform = torchaudio.transforms.MFCC(
@@ -60,6 +66,20 @@ class AudioProcessor:
         mel_power = self.melspec(waveform)      # -> (batch, n_mels, time_frames)
         mel_db    = self.amplitude_to_db(mel_power)
         return mel_db
+    
+    def process_for_wav2vec(self, waveform: torch.Tensor) -> torch.Tensor:
+        """
+        Takes a raw waveform tensor and prepares it for the Wav2Vec2 model.
+        The Hugging Face processor handles normalization internally.
+        """
+        # The processor expects a raw waveform, not a batch.
+        # It also expects the native sampling rate of the audio.
+        # Since we already resampled to 16kHz in load_audio, this is simple.
+        return self.wav2vec_feature_extractor(
+            waveform, 
+            sampling_rate=self.config.sample_rate,
+            return_tensors="pt"
+        ).input_values.squeeze(0) # Squeeze to remove the batch dim it adds
 
 
     def load_audio(self, path: Path) -> torch.Tensor:
@@ -91,12 +111,16 @@ class AudioProcessor:
 
     def extract_features(self, waveform: torch.Tensor) -> Dict[str, torch.Tensor]:
         if waveform.numel() == 0:
-            logger.warning("Cannot extract features from empty waveform.")
+            logger.warning("!!!!Cannot extract features from empty waveform.!!!!!! LOADING DUMMY FEATURES")
             dummy_mel_frames = int(self.config.max_duration * self.config.sample_rate / self.config.hop_length) + 1
+            dummy_wav2vec_len = int(self.config.max_duration * self.config.sample_rate)
+
             return {
                 "zcr": torch.zeros(1, dummy_mel_frames),
                 "rmse": torch.zeros(1, dummy_mel_frames),
                 "mel": torch.zeros(self.config.n_mels, dummy_mel_frames),
+                "wav2vec_input": torch.zeros(dummy_wav2vec_len), # Add this
+
                 "mfcc": torch.zeros(self.config.mfcc_bins, dummy_mel_frames)
             }
 
@@ -105,6 +129,8 @@ class AudioProcessor:
 
 
         features["mel"] = self.compute_mel(waveform)
+        features["wav2vec_input"] = self.process_for_wav2vec(waveform)
+
 
         mfcc_input = waveform.unsqueeze(0) if waveform.dim() == 1 else waveform
         features["mfcc"] = self.mfcc_transform(mfcc_input).squeeze(0)
@@ -171,7 +197,7 @@ class DeepfakeDataset(torch.utils.data.Dataset): # Renamed from SpeakerDataset
                 torchaudio.transforms.TimeMasking(time_mask_param=35)
             )
 
-    def __getitem__(self, idx: int) -> Optional[Tuple[Dict[str, torch.Tensor], int]]:
+    def __getitem__(self, idx: int) -> Optional[Dict[str, torch.Tensor]]: # <-- Return type changed for clarity
         if idx >= len(self.samples):
             raise IndexError("Index out of bounds")
 
@@ -179,17 +205,20 @@ class DeepfakeDataset(torch.utils.data.Dataset): # Renamed from SpeakerDataset
         waveform = self.processor.load_audio(sample_info["path"])
 
         if waveform.numel() == 0:
-            logger.warning(f"Skipping sample {sample_info['path']} due to loading error or empty audio. Returning None.")
+            logger.warning(f"Skipping sample {sample_info['path']}. Returning None.")
             return None
 
+        # This now returns a dict with "mel" and "wav2vec_input"
         features = self.processor.extract_features(waveform)
 
+        # Augmentation only on mel spectrogram
         if self.augment and self.spec_augment_chain is not None:
             features["mel"] = self.spec_augment_chain(features["mel"].unsqueeze(0)).squeeze(0)
 
-        # The label is now 0 for bona-fide, 1 for spoof
         deepfake_label = sample_info["label"]
-        return features, deepfake_label
+        
+        # --- KEY CHANGE: Return a dictionary that our new collate_fn can handle ---
+        return {"features": features, "labels": torch.tensor(deepfake_label, dtype=torch.long)}
 
     def __len__(self) -> int:
         return len(self.samples)
