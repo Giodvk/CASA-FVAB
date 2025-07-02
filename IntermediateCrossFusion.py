@@ -11,6 +11,7 @@ import torch.nn as nn
 from scipy.optimize import brentq
 from scipy.interpolate import interp1d
 from sklearn.metrics import roc_curve, precision_recall_fscore_support
+import torch.nn.functional as F
 
 from dataAudio import AudioConfig, AudioProcessor, DeepfakeDataset
 
@@ -78,43 +79,68 @@ class CrossAttention(nn.Module):
         return self.out_proj(attended_v)
 
 
+import torch
+import torch.nn as nn
+from typing import Tuple
+
+# Assume you have a CrossAttention module defined somewhere that might return a tuple
+# e.g., class CrossAttention(nn.Module): ...
+
 class WSFM(nn.Module):
     """
-    Waveform-Spectrogram Fusion Module (WSFM).
-    Performs bi-directional cross-attention between the two modalities.
+    Waveform-Spectrogram Fusion Module (WSFM) - CORRECTED VERSION
+
+    Performs UNIDIRECTIONAL cross-attention. The trainable spectrogram branch
+    (student) attends to the frozen Wav2Vec branch (teacher) to gather context.
+    The Wav2Vec features are passed through UNMODIFIED.
     """
     def __init__(self, wav2vec_dim: int, spec_dim: int, hidden_dim: int = 256):
         super().__init__()
-        self.wav2vec_dim = wav2vec_dim
-        self.spec_dim = spec_dim
+        # We only need one-way attention: student queries the teacher
+        self.spec_attends_to_wav2vec = CrossAttention(query_dim=spec_dim, key_dim=wav2vec_dim, hidden_dim=hidden_dim)
 
-        self.wav2vec_attends_to_spec = CrossAttention(wav2vec_dim, spec_dim, hidden_dim)
-        self.spec_attends_to_wav2vec = CrossAttention(spec_dim, wav2vec_dim, hidden_dim)
-
-        self.norm1 = nn.LayerNorm(wav2vec_dim)
-        self.norm2 = nn.LayerNorm(spec_dim)
+        # We only need to normalize the features we are updating: the spectrogram features
+        self.norm = nn.LayerNorm(spec_dim)
 
     def forward(self, f_wav2vec: torch.Tensor, f_spec: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        # f_wav2vec: [Batch, Time, Dim_W]
-        # f_spec:    [Batch, Dim_S, Height, Width]
-
+        """
+        Args:
+            f_wav2vec (torch.Tensor): Teacher features [B, T, D_w]. These will NOT be modified.
+            f_spec (torch.Tensor): Student features [B, C, H, W]. These WILL be updated.
+        
+        Returns:
+            A tuple containing:
+            - The original, unmodified f_wav2vec tensor.
+            - The updated f_spec tensor.
+        """
         batch_size, spec_c, spec_h, spec_w = f_spec.shape
         
-        # --- 1. Spectrogram branch queries Wav2Vec branch ---
-        # Reshape spec features into a sequence for attention
+        # --- Spectrogram branch queries Wav2Vec branch ---
+        
+        # 1. Reshape spec features into a sequence for attention
         f_spec_seq = f_spec.flatten(2).permute(0, 2, 1) # [B, H*W, C]
         
-        spec_context = self.spec_attends_to_wav2vec(f_spec_seq, f_wav2vec, f_wav2vec)
-        f_spec_updated_seq = self.norm2(f_spec_seq + spec_context)
+        # 2. Perform cross-attention and CORRECTLY UNPACK THE OUTPUT
+        attention_output = self.spec_attends_to_wav2vec(
+            query=f_spec_seq, 
+            key=f_wav2vec, 
+            value=f_wav2vec
+        )
         
-        # Reshape back to 2D feature map
+        # Check if the output is a tuple (context, weights) and take only the context
+        if isinstance(attention_output, tuple):
+            spec_context = attention_output[0]
+        else:
+            spec_context = attention_output
+
+        # 3. Apply residual connection and normalization
+        f_spec_updated_seq = self.norm(f_spec_seq + spec_context)
+        
+        # 4. Reshape back to 2D feature map format
         f_spec_updated = f_spec_updated_seq.permute(0, 2, 1).view(batch_size, spec_c, spec_h, spec_w)
 
-        # --- 2. Wav2Vec branch queries Spectrogram branch ---
-        wav2vec_context = self.wav2vec_attends_to_spec(f_wav2vec, f_spec_seq, f_spec_seq)
-        f_wav2vec_updated = self.norm1(f_wav2vec + wav2vec_context)
-
-        return f_wav2vec_updated, f_spec_updated
+        # Return the UNMODIFIED teacher features and the UPDATED student features
+        return f_wav2vec, f_spec_updated
 
 
 class ResidualBlock(nn.Module):
@@ -245,7 +271,7 @@ class MultiViewCollaborativeNet(nn.Module):
             s_out = self.spec_blocks[i](f_s)
 
             # The WSFM uses the expert's output to guide the student, but only updates the student's features
-            s_out = self.wsfms[i](w_out, s_out) # Assuming WSFM outputs a new f_s
+            w_out, s_out = self.wsfms[i](w_out, s_out) # Assuming WSFM outputs a new f_s
 
             # Update features for the next iteration
             f_w = w_out  # f_w remains the pure, unmodified output from the expert
@@ -275,76 +301,106 @@ class MultiViewCollaborativeNet(nn.Module):
 
 class CollaborativeLoss(nn.Module):
     def __init__(self, 
-                 w_cls: float = 1.0, 
-                 w_cls_s: float = 0.5, 
-                 w_intra_s: float = 0.2, 
-                 margin: float = 0.4):
+                 w_cls: float = 1.0,      # Weight for final classification
+                 w_cls_s: float = 0.5,    # Weight for student's aux classification
+                 w_distill: float = 0.5,  # Weight for distillation (inter-view)
+                 w_intra_s: float = 0.2,  # Weight for student's metric learning (inner-view)
+                 margin: float = 0.4, 
+                 temp: float = 0.1):
         super().__init__()
-        self.bce = nn.CrossEntropyLoss()
+        self.cross_entropy_loss = nn.CrossEntropyLoss()
         
         # Pesi per bilanciare le componenti della loss
         self.w_cls = w_cls           # Peso per la classificazione principale
         self.w_cls_s = w_cls_s       # Peso per la classificazione ausiliaria dello spettrogramma
+        self.w_distill = w_distill
         self.w_intra_s = w_intra_s   # Peso per la loss metrica dello spettrogramma
+        self.temp = temp
+        
+        
         
         # Parametri per la loss metrica (precedentemente inner-view)
         self.margin = margin
 
-    def _calculate_intra_view_loss_s(self, features: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    def _calculate_intra_view_loss(self, features: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
         """
-        Calcola una loss metrica (precedentemente chiamata "inner-view") solo per 
-        le feature del ramo spettrogramma (s).
-        L'obiettivo è raggruppare gli embedding della stessa classe e allontanare
-        quelli di classi diverse.
+        Calculates a metric learning loss within a single view (the student branch).
+        This encourages instances of the same class to be closer in the embedding
+        space than instances of different classes.
         """
-        # Normalizzazione L2 per calcolare la similarità coseno
-        features_norm = nn.functional.normalize(features, p=2, dim=1)
-        # Matrice di similarità coseno tra tutti gli elementi del batch
+        # L2-normalize features to use cosine similarity
+        features_norm = F.normalize(features, p=2, dim=1)
+        
+        # Calculate the cosine similarity matrix
         sim_matrix = torch.matmul(features_norm, features_norm.t())
         
-        # Maschere per identificare le coppie positive (stessa etichetta) e negative
+        # Create masks to identify positive (same class) and negative (different class) pairs
         labels_matrix = labels.unsqueeze(0) == labels.unsqueeze(1)
-        # Le coppie positive non includono un elemento con se stesso
+        # Positive pairs do not include an element with itself
         pos_mask = labels_matrix.fill_diagonal_(False)
-        # Le coppie negative sono tutte quelle che non sono positive
-        neg_mask = ~labels_matrix
+        # Negative pairs are all pairs that are not of the same class
+        neg_mask = ~labels_matrix.fill_diagonal_(True) # Also exclude self-similarity
         
-        # Se non ci sono coppie positive o negative nel batch, la loss è 0
+        # Handle edge case where a batch might not have any positive or negative pairs
         if not pos_mask.any() or not neg_mask.any():
             return torch.tensor(0.0, device=features.device)
 
-        # 1. Avvicina le coppie positive: la loss è alta quando la similarità è bassa
+        # 1. Pull positive pairs together: loss is high when similarity is low.
         pos_sim = sim_matrix[pos_mask]
-        pos_loss = (1 - pos_sim).clamp(min=0).mean()
+        pos_loss = (1.0 - pos_sim).clamp(min=0).mean()
         
-        # 2. Allontana le coppie negative: la loss è alta quando la similarità
-        #    supera un margine.
+        # 2. Push negative pairs apart: loss is high when similarity exceeds a margin.
         neg_sim = sim_matrix[neg_mask]
         neg_loss = (neg_sim - self.margin).clamp(min=0).mean()
         
         return pos_loss + neg_loss
 
-    def forward(self, outputs: Dict[str, torch.Tensor], labels: torch.Tensor) -> torch.Tensor:
-        # --- Componenti di Loss Valide ---
-
-        # 1. Loss di Classificazione Principale (sul verdetto finale/combinato)
-        #    Questa è la loss più importante per insegnare la COLLABORAZIONE.
-        loss_cls = self.bce(outputs["final_logits"], labels)
-
-        # 2. Loss di Classificazione Ausiliaria (sul solo ramo spettrogramma)
-        #    Agisce come regolarizzazione per il ramo addestrabile.
-        loss_cls_s = self.bce(outputs["logits_s"], labels)
-
-        # 3. Loss Metrica Intra-Vista (sul solo ramo spettrogramma)
-        #    Struttura lo spazio degli embedding del ramo addestrabile.
-        loss_intra_s = self._calculate_intra_view_loss_s(outputs["feat_s"], labels)
+    def _calculate_distillation_loss(self, feat_teacher: torch.Tensor, feat_student: torch.Tensor) -> torch.Tensor:
+        """
+        Calculates a contrastive knowledge distillation loss (InfoNCE).
+        It encourages the student's feature for a given sample to be most similar
+        to the teacher's feature for that same sample, and dissimilar to the
+        teacher's features for all other samples in the batch.
+        """
+        # L2-normalize both sets of features
+        teacher_norm = F.normalize(feat_teacher, p=2, dim=1)
+        student_norm = F.normalize(feat_student, p=2, dim=1)
         
+        # Calculate the similarity matrix between student (queries) and teacher (keys)
+        # The goal is to make the diagonal (correct pairs) have the highest scores
+        sim_matrix = torch.matmul(student_norm, teacher_norm.t()) / self.temp
+        
+        # The ground-truth labels are the diagonal indices (0, 1, 2, ...)
+        # because we want student[i] to match teacher[i]
+        batch_size = sim_matrix.size(0)
+        labels = torch.arange(batch_size, device=sim_matrix.device)
+        
+        # Use cross-entropy loss to maximize the scores on the diagonal
+        loss = self.cross_entropy_loss(sim_matrix, labels)
+        return loss
 
+    def forward(self, outputs: Dict[str, torch.Tensor], labels: torch.Tensor) -> torch.Tensor:
+        # 1. Main classification loss (Essential)
+        loss_cls = self.cross_entropy_loss(outputs["final_logits"], labels)
 
-        # --- Calcolo della Loss Finale Combinata ---
-        # Somma pesata delle sole componenti di loss utili e coerenti.
-        total_loss = (self.w_cls * loss_cls + 
-                      self.w_cls_s * loss_cls_s + 
+        # 2. Auxiliary loss for the STUDENT branch (Good Regularization)
+        loss_cls_s = self.cross_entropy_loss(outputs["logits_s"], labels)
+
+        # 3. Knowledge Distillation Loss (CRITICAL)
+        #    Align student features (feat_s) to the static teacher features (feat_w)
+        loss_distill = self._calculate_distillation_loss(outputs["feat_w"].detach(), outputs["feat_s"])
+
+        # 4. Intra-view loss for the STUDENT branch (Good Regularization)
+        loss_intra_s = self._calculate_intra_view_loss(outputs["feat_s"], labels)
+
+        # --- DO NOT COMPUTE LOSSES FOR THE FROZEN WAV2VEC BRANCH ---
+        # loss_cls_w is useless
+        # loss_inner_w is useless
+
+        # Final weighted sum
+        total_loss = (self.w_cls * loss_cls +
+                      self.w_cls_s * loss_cls_s +
+                      self.w_distill * loss_distill +
                       self.w_intra_s * loss_intra_s)
         
         return total_loss
