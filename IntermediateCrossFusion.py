@@ -1,6 +1,6 @@
 import logging
 from typing import List, Optional, Dict, Tuple
-from DataBalancingDeepSeek import train_speaker, test_speaker
+from Data_balancing_In_The_Wild import train_speaker, test_speaker
 
 import numpy as np
 import torch
@@ -11,6 +11,19 @@ from sklearn.metrics import roc_curve, precision_recall_fscore_support
 from transformers import Wav2Vec2Model
 
 from dataAudio import AudioConfig, AudioProcessor, DeepfakeDataset
+
+import argparse
+import logging
+from pathlib import Path
+from typing import Optional, Dict, List, Tuple
+
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+from scipy.optimize import brentq
+from scipy.interpolate import interp1d
+from sklearn.metrics import roc_curve, precision_recall_fscore_support
 
 # ===================================================================
 #  Configuration & Logging (Assuming these are defined elsewhere)
@@ -222,15 +235,20 @@ class MultiViewCollaborativeNet(nn.Module):
         # --- Core Collaborative Loop ---
         for i in range(len(self.spec_blocks)):
             # Process one block from each branch
+            # Corrected Unidirectional Flow
             with torch.no_grad():
-                # Wav2Vec layer is frozen
-                f_w = self.wav2vec.encoder.layers[i](f_w)[0]
-            
-            # Spectrogram block is trainable
-            f_s = self.spec_blocks[i](f_s)
-            
-            # Fusion module is trainable
-            f_w, f_s = self.wsfms[i](f_w, f_s)
+                # Get the expert's output for this layer, but don't modify it further
+                w_out = self.wav2vec.encoder.layers[i](f_w)[0]
+
+            # Process the student branch
+            s_out = self.spec_blocks[i](f_s)
+
+            # The WSFM uses the expert's output to guide the student, but only updates the student's features
+            s_out = self.wsfms[i](w_out, s_out) # Assuming WSFM outputs a new f_s
+
+            # Update features for the next iteration
+            f_w = w_out  # f_w remains the pure, unmodified output from the expert
+            f_s = s_out  # f_s is the collaboratively refined feature map
 
         # --- Final Pooling and Classification ---
         f_w_vec = self.final_pool_w(f_w.permute(0, 2, 1)).squeeze(-1)
@@ -472,33 +490,11 @@ def evaluate_collaborative(
         "eer": eer
     }
 
-import argparse
-import logging
-from pathlib import Path
-from typing import Optional, Dict, List, Tuple
 
-import numpy as np
-import pandas as pd
-import torch
-import torch.nn as nn
-from scipy.optimize import brentq
-from scipy.interpolate import interp1d
-from sklearn.metrics import roc_curve, precision_recall_fscore_support
 
-# ===================================================================
-# IMPORTANT: Make sure all your new classes are imported here
-# from your_model_file import MultiViewCollaborativeNet, CollaborativeLoss
-# from your_dataset_file import DeepfakeDataset, collate_fn_skip_none
-# from your_processor_file import AudioProcessor, AudioConfig
-# from your_trainer_file import train_collaborative, evaluate_collaborative
-# ===================================================================
 
-# For demonstration, I'll assume they are all in this file.
-# In a real project, they should be in separate, organized files.
 
-# --- PASTE ALL THE NEW CLASSES HERE ---
-# (MultiViewCollaborativeNet, CollaborativeLoss, train_collaborative, etc.)
-# ...
+
 
 def main():
     parser = argparse.ArgumentParser(description="Multi-View Collaborative Training for Deepfake Detection")
@@ -512,8 +508,8 @@ def main():
     parser.add_argument("--test_split_ratio", type=float, default=0.2, help="Ratio for test set split.")
     
     # --- Optimizer and Scheduler Arguments ---
-    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate for trainable parts.")
-    parser.add_argument("--weight_decay", type=float, default=1e-5, help="L2 regularization.")
+    parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate for trainable parts.")
+    parser.add_argument("--weight_decay", type=float, default=1e-4, help="L2 regularization.")
 
     # --- Model Architecture Arguments ---
     parser.add_argument("--wav2vec_model_name", type=str, default="facebook/wav2vec2-large-xlsr-53", help="Hugging Face model name for the frozen branch.")
@@ -620,7 +616,7 @@ def main():
         # We need a criterion instance for evaluation, even if we only care about metrics
         eval_criterion = CollaborativeLoss().to(device)
         
-        test_results = evaluate_collaborative(final_model, test_loader, eval_criterion, device)
+        test_results = evaluate_collaborative(final_model, test_loader, eval_criterion)
         
         logger.info(
             f"Final Test Results:\n"
