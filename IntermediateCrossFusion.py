@@ -1,14 +1,16 @@
 import logging
 from typing import List, Optional, Dict, Tuple
-from DataBalancingDeepSeek import train_speaker, test_speaker
-
+from split_dataset import train_speaker, test_speaker
+from transformers import Wav2Vec2Model
+import argparse
+from pathlib import Path
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 from scipy.optimize import brentq
 from scipy.interpolate import interp1d
 from sklearn.metrics import roc_curve, precision_recall_fscore_support
-from transformers import Wav2Vec2Model
 
 from dataAudio import AudioConfig, AudioProcessor, DeepfakeDataset
 
@@ -23,7 +25,6 @@ if torch.cuda.is_available():
 
 else:
     device = torch.device("cpu")
-print(f"--- Utilizzo del dispositivo: {device} ---")
 
 # ===================================================================
 #  1. Core Building Blocks for the Collaborative Network
@@ -400,7 +401,7 @@ def train_collaborative(
         metrics["train_loss"].append(avg_epoch_train_loss)
 
         if val_loader:
-            val_results = evaluate_collaborative(model, val_loader, criterion, device)
+            val_results = evaluate_collaborative(model, val_loader, criterion)
             metrics["val_loss"].append(val_results["loss"])
             metrics["val_acc"].append(val_results["acc"])
             metrics["val_precision"].append(val_results["precision"])
@@ -472,33 +473,6 @@ def evaluate_collaborative(
         "eer": eer
     }
 
-import argparse
-import logging
-from pathlib import Path
-from typing import Optional, Dict, List, Tuple
-
-import numpy as np
-import pandas as pd
-import torch
-import torch.nn as nn
-from scipy.optimize import brentq
-from scipy.interpolate import interp1d
-from sklearn.metrics import roc_curve, precision_recall_fscore_support
-
-# ===================================================================
-# IMPORTANT: Make sure all your new classes are imported here
-# from your_model_file import MultiViewCollaborativeNet, CollaborativeLoss
-# from your_dataset_file import DeepfakeDataset, collate_fn_skip_none
-# from your_processor_file import AudioProcessor, AudioConfig
-# from your_trainer_file import train_collaborative, evaluate_collaborative
-# ===================================================================
-
-# For demonstration, I'll assume they are all in this file.
-# In a real project, they should be in separate, organized files.
-
-# --- PASTE ALL THE NEW CLASSES HERE ---
-# (MultiViewCollaborativeNet, CollaborativeLoss, train_collaborative, etc.)
-# ...
 
 def main():
     parser = argparse.ArgumentParser(description="Multi-View Collaborative Training for Deepfake Detection")
@@ -536,7 +510,6 @@ def main():
 
     # --- Load and Split Metadata ---
     logger.info("--- Loading and Splitting Metadata ---")
-    full_metadata_df = pd.read_csv(args.metadata_path)
     full_metadata_df = pd.read_csv(args.metadata_path)
     if full_metadata_df.empty:
         logger.error(f"Metadata CSV file at {args.metadata_path} is empty. Exiting.")
@@ -620,7 +593,7 @@ def main():
         # We need a criterion instance for evaluation, even if we only care about metrics
         eval_criterion = CollaborativeLoss().to(device)
         
-        test_results = evaluate_collaborative(final_model, test_loader, eval_criterion, device)
+        test_results = evaluate_collaborative(final_model, test_loader, eval_criterion)
         
         logger.info(
             f"Final Test Results:\n"
