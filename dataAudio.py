@@ -25,7 +25,7 @@ class AudioConfig:
 
 
 class AudioProcessor:
-    def __init__(self, config: AudioConfig, wav2vec_model_name: str = "facebook/wav2vec2-large-xls-r-300m"):
+    def __init__(self, config: AudioConfig, wav2vec_model_name: str = "facebook/wav2vec2-large-xlsr-53"):
         self.config = config
         self.melspec = torchaudio.transforms.MelSpectrogram(
             sample_rate=config.sample_rate,

@@ -40,6 +40,44 @@ if torch.cuda.is_available():
 else:
     device = torch.device("cpu")
 
+
+def temporal_sparsity_loss(attn_weights: torch.Tensor) -> torch.Tensor:
+    """Stable entropy-based sparsity loss"""
+    # attn_weights: [B, heads, Q, K]
+    probs = attn_weights.clamp(min=1e-12)  # Avoid log(0)
+    entropy = - (probs * torch.log(probs)).sum(dim=-1)  # Sum over keys
+    max_entropy = torch.log(torch.tensor(attn_weights.shape[-1], device=attn_weights.device))
+    normalized_entropy = entropy / max_entropy
+    return normalized_entropy.mean()  # Minimize this = sparser attention
+
+def head_diversity_loss(attn_weights: torch.Tensor) -> torch.Tensor:
+    """Memory-efficient pairwise diversity loss"""
+    B, H, Q, K = attn_weights.shape
+    diversity = 0
+    for i in range(H):
+        for j in range(i+1, H):
+            diff = attn_weights[:, i] - attn_weights[:, j]
+            diversity += diff.abs().mean()
+    return diversity / (H*(H-1)/2 + 1e-8)
+
+def content_consistency_loss(attn_weights: torch.Tensor, features: torch.Tensor) -> torch.Tensor:
+    """Feature similarity alignment without new projections"""
+    # attn_weights: [B, heads, Q, K]
+    # features: [B, C, H, W] (ResNet output before flattening)
+    
+    # Flatten spatial dimensions
+    B, C, H, W = features.shape
+    queries = features.view(B, C, H*W).permute(0, 2, 1)  # [B, H*W, C]
+    
+    # Compute feature similarity
+    sim_matrix = torch.cdist(queries, queries, p=2)  # [B, Q, Q]
+    sim_matrix = 1 / (1 + sim_matrix)  # Convert distance to similarity
+    
+    # Compute attention similarity
+    attn_sim = torch.einsum('bhqk,bhqk->bhq', attn_weights, attn_weights)  # [B, heads, Q]
+    
+    # Align feature and attention similarities
+    return F.mse_loss(attn_sim.mean(dim=1), sim_matrix.mean(dim=-1))
 # ===================================================================
 #  1. Core Building Blocks for the Collaborative Network
 # ===================================================================
@@ -62,7 +100,7 @@ class CrossAttention(nn.Module):
         self.out_proj = nn.Linear(hidden_dim, query_dim) # Project back to query's dimension
         self.scale = self.head_dim ** -0.5
 
-    def forward(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
+    def forward(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor):
         batch_size, query_len, _ = query.shape
         _, key_len, _ = key.shape
 
@@ -74,9 +112,13 @@ class CrossAttention(nn.Module):
         attn_weights = torch.softmax(attn_scores, dim=-1)
 
         attended_v = torch.matmul(attn_weights, v)
-        attended_v = attended_v.transpose(1, 2).contiguous().view(batch_size, query_len, self.num_heads * self.head_dim)
+        attended_v = attended_v.transpose(1, 2).contiguous().view(batch_size, query_len, -1)
 
-        return self.out_proj(attended_v)
+        return self.out_proj(attended_v), {
+            'attn_weights': attn_weights,
+            'queries': query,  # Original queries
+            'keys': key        # Original keys
+        }
 
 
 import torch
@@ -102,7 +144,7 @@ class WSFM(nn.Module):
         # We only need to normalize the features we are updating: the spectrogram features
         self.norm = nn.LayerNorm(spec_dim)
 
-    def forward(self, f_wav2vec: torch.Tensor, f_spec: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, f_wav2vec: torch.Tensor, f_spec: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Args:
             f_wav2vec (torch.Tensor): Teacher features [B, T, D_w]. These will NOT be modified.
@@ -121,7 +163,7 @@ class WSFM(nn.Module):
         f_spec_seq = f_spec.flatten(2).permute(0, 2, 1) # [B, H*W, C]
         
         # 2. Perform cross-attention and CORRECTLY UNPACK THE OUTPUT
-        attention_output = self.spec_attends_to_wav2vec(
+        attention_output, attn_data = self.spec_attends_to_wav2vec(
             query=f_spec_seq, 
             key=f_wav2vec, 
             value=f_wav2vec
@@ -140,7 +182,7 @@ class WSFM(nn.Module):
         f_spec_updated = f_spec_updated_seq.permute(0, 2, 1).view(batch_size, spec_c, spec_h, spec_w)
 
         # Return the UNMODIFIED teacher features and the UPDATED student features
-        return f_wav2vec, f_spec_updated
+        return f_wav2vec, f_spec_updated, attn_data
 
 
 class ResidualBlock(nn.Module):
@@ -237,12 +279,10 @@ class MultiViewCollaborativeNet(nn.Module):
         self.final_pool_w = nn.AdaptiveAvgPool1d(1)
         self.final_pool_s = nn.AdaptiveAvgPool2d((1, 1))
         
-        final_feature_dim = wav2vec_dim + spec_dim
-        self.final_classifier = nn.Linear(final_feature_dim, 2)
-        self.aux_classifier_w = nn.Linear(wav2vec_dim, 2)
         self.aux_classifier_s = nn.Linear(spec_dim, 2)
 
-    def forward(self, x_wav2vec_input: torch.Tensor, x_spec: torch.Tensor) -> Dict[str, torch.Tensor]:
+
+    def forward(self, x_wav2vec_input: torch.Tensor, x_spec: torch.Tensor):
         # Ensure spec input is 4D
         if x_spec.dim() == 3:
             x_spec = x_spec.unsqueeze(1)
@@ -259,6 +299,10 @@ class MultiViewCollaborativeNet(nn.Module):
             
         f_s = self.spec_initial_conv(x_spec)
 
+        all_temporal_losses = []  # NEW: Track individual losses
+        all_diversity_losses = []  # NEW
+        all_consistency_losses = []  # NEW
+
         # --- Core Collaborative Loop ---
         for i in range(len(self.spec_blocks)):
             # Process one block from each branch
@@ -267,11 +311,25 @@ class MultiViewCollaborativeNet(nn.Module):
                 # Get the expert's output for this layer, but don't modify it further
                 w_out = self.wav2vec.encoder.layers[i](f_w)[0]
 
+
+
             # Process the student branch
             s_out = self.spec_blocks[i](f_s)
 
             # The WSFM uses the expert's output to guide the student, but only updates the student's features
-            w_out, s_out = self.wsfms[i](w_out, s_out) # Assuming WSFM outputs a new f_s
+            w_out, s_out, attn_data = self.wsfms[i](w_out, s_out) # Assuming WSFM outputs a new f_s
+
+            attn_weights=attn_data['attn_weights']
+            temporal_loss = temporal_sparsity_loss(attn_weights)
+            diversity_loss = head_diversity_loss(attn_weights)
+            consistency_loss = content_consistency_loss(attn_weights, s_out)  # s_out is ResNet feature
+            
+
+            
+            # Store individual losses
+            all_temporal_losses.append(temporal_loss)
+            all_diversity_losses.append(diversity_loss)
+            all_consistency_losses.append(consistency_loss)
 
             # Update features for the next iteration
             f_w = w_out  # f_w remains the pure, unmodified output from the expert
@@ -281,18 +339,16 @@ class MultiViewCollaborativeNet(nn.Module):
         f_w_vec = self.final_pool_w(f_w.permute(0, 2, 1)).squeeze(-1)
         f_s_vec = self.final_pool_s(f_s).flatten(1)
 
-        final_features = torch.cat([f_w_vec, f_s_vec], dim=1)
-        final_logits = self.final_classifier(final_features)
 
-        logits_w = self.aux_classifier_w(f_w_vec)
         logits_s = self.aux_classifier_s(f_s_vec)
 
         return {
-            "final_logits": final_logits,
-            "logits_w": logits_w,
-            "logits_s": logits_s,
+            "final_logits": logits_s,
             "feat_w": f_w_vec,
-            "feat_s": f_s_vec
+            "feat_s": f_s_vec,
+            "temporal_losses": torch.stack(all_temporal_losses),  # NEW
+            "diversity_losses": torch.stack(all_diversity_losses),  # NEW
+            "consistency_losses": torch.stack(all_consistency_losses),  # NEW
         }
 
 # ===================================================================
@@ -302,106 +358,169 @@ class MultiViewCollaborativeNet(nn.Module):
 class CollaborativeLoss(nn.Module):
     def __init__(self, 
                  w_cls: float = 1.0,      # Weight for final classification
-                 w_cls_s: float = 0.5,    # Weight for student's aux classification
-                 w_distill: float = 0.5,  # Weight for distillation (inter-view)
-                 w_intra_s: float = 0.2,  # Weight for student's metric learning (inner-view)
-                 margin: float = 0.4, 
-                 temp: float = 0.1):
+                 w_intra_s: float = 0.6,  # Weight for student's metric learning (inner-view)
+                 w_attn: float = 0.2,
+                 temp: float = 0.5,
+                 margin: float = 0,
+                 ema_decay: float = 0.99,
+                 min_diversity: float = 0.01,
+                 focus_factor: float =5.0):
         super().__init__()
         self.cross_entropy_loss = nn.CrossEntropyLoss()
         
         # Pesi per bilanciare le componenti della loss
         self.w_cls = w_cls           # Peso per la classificazione principale
-        self.w_cls_s = w_cls_s       # Peso per la classificazione ausiliaria dello spettrogramma
-        self.w_distill = w_distill
         self.w_intra_s = w_intra_s   # Peso per la loss metrica dello spettrogramma
+        self.w_attn=w_attn
         self.temp = temp
+        self.margin=margin
+        self.focus_factor = focus_factor
+                # Centroid stability parameters
+        self.ema_decay = ema_decay
+        self.min_diversity = min_diversity
+        
+        # Initialize EMA buffers with placeholders
+        self.register_buffer('real_center_ema', None)
+        self.register_buffer('fake_center_ema', None)
+        self.register_buffer('diversity_ema', torch.tensor(0.5))
+        self.register_buffer('initialized', torch.tensor(False))
         
         
         
         # Parametri per la loss metrica (precedentemente inner-view)
-        self.margin = margin
 
-    def _calculate_intra_view_loss(self, features: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-        """
-        Calculates a metric learning loss within a single view (the student branch).
-        This encourages instances of the same class to be closer in the embedding
-        space than instances of different classes.
-        """
-        # L2-normalize features to use cosine similarity
-        features_norm = F.normalize(features, p=2, dim=1)
+
+
+    def _artifact_contrastive_loss(self, features: torch.Tensor, 
+                                 labels: torch.Tensor) -> torch.Tensor:
+        real_mask = labels == 0
+        fake_mask = labels == 1
         
-        # Calculate the cosine similarity matrix
-        sim_matrix = torch.matmul(features_norm, features_norm.t())
-        
-        # Create masks to identify positive (same class) and negative (different class) pairs
-        labels_matrix = labels.unsqueeze(0) == labels.unsqueeze(1)
-        # Positive pairs do not include an element with itself
-        pos_mask = labels_matrix.fill_diagonal_(False)
-        # Negative pairs are all pairs that are not of the same class
-        neg_mask = ~labels_matrix.fill_diagonal_(True) # Also exclude self-similarity
-        
-        # Handle edge case where a batch might not have any positive or negative pairs
-        if not pos_mask.any() or not neg_mask.any():
+        # Skip if insufficient samples
+        n_real = real_mask.sum().item()
+        n_fake = fake_mask.sum().item()
+        if n_real < 2 or n_fake < 1:
             return torch.tensor(0.0, device=features.device)
+        
+        # ===== ROBUST CENTROID INITIALIZATION ===== #
+        if not self.initialized:
+            self.real_center_ema = features[real_mask].mean(dim=0, keepdim=True).detach()
+            self.fake_center_ema = features[fake_mask].mean(dim=0, keepdim=True).detach()
+            
+            # Compute initial diversity using MAD (more robust than std)
+            real_med = features[real_mask].median(dim=0).values
+            real_mad = (features[real_mask] - real_med).abs().median().clamp(min=self.min_diversity)
+            
+            fake_med = features[fake_mask].median(dim=0).values
+            fake_mad = (features[fake_mask] - fake_med).abs().median().clamp(min=self.min_diversity)
+            
+            self.diversity_ema = ((real_mad + fake_mad) / 2).detach()
+            self.initialized = torch.tensor(True)
+            return torch.ones(1, device=features.device)  # Warm-start as tensor
+        
+        # ===== COSINE DISTANCE WITH FOCUSED MARGIN ===== #
+        # Normalize features and centroids
+        features_norm = F.normalize(features, p=2, dim=1)
+        real_center_norm = F.normalize(self.real_center_ema, p=2, dim=1)
+        fake_center_norm = F.normalize(self.fake_center_ema, p=2, dim=1)
+        
+        # Compute cosine distances (1 - similarity)
+        real_dists = 1 - torch.mm(features_norm, real_center_norm.t()).squeeze(1)
+        fake_dists = 1 - torch.mm(features_norm, fake_center_norm.t()).squeeze(1)
+        
+        # Adaptive margin based on sample difficulty
+        with torch.no_grad():
+            # Dynamic margin scaling for hard samples
+            difficulty = (real_dists - fake_dists).abs()
+            margin_scale = 1 + (self.focus_factor * torch.sigmoid(difficulty * 5))
+            adaptive_margin = self.margin * margin_scale
+        
+        # ===== FOCUSED LOSS CALCULATION ===== #
+        losses = []
+        for i in range(len(features)):
+            if labels[i] == 0:  # Real sample
+                violation = fake_dists[i] - real_dists[i] + adaptive_margin[i]
+                if violation > 0:
+                    # Quadratic penalty for hard samples
+                    loss = violation ** 2
+                else:
+                    loss = torch.tensor(0.0, device=features.device)  # FIX: Use tensor
+            else:  # Fake sample
+                violation = real_dists[i] - fake_dists[i] + adaptive_margin[i]
+                if violation > 0:
+                    loss = violation ** 2
+                else:
+                    loss = torch.tensor(0.0, device=features.device)  # FIX: Use tensor
+                    
+            losses.append(loss)
+        
+        # Convert list to tensor stack
+        loss_tensor = torch.stack(losses)  # Now all elements are tensors
+        
+        # Update centroids (after loss calculation)
+        with torch.no_grad():
+            real_center_batch = features[real_mask].mean(dim=0, keepdim=True)
+            fake_center_batch = features[fake_mask].mean(dim=0, keepdim=True)
+            
+            # Update EMAs
+            self.real_center_ema = (self.ema_decay * self.real_center_ema + 
+                                   (1 - self.ema_decay) * real_center_batch)
+            self.fake_center_ema = (self.ema_decay * self.fake_center_ema + 
+                                   (1 - self.ema_decay) * fake_center_batch)
+            
+            # Update diversity using IQR (interquartile range)
+            real_sorted, _ = features[real_mask].sort(dim=0)
+            q1 = real_sorted[n_real//4]
+            q3 = real_sorted[min(3*n_real//4, n_real-1)]
+            real_iqr = (q3 - q1).mean().clamp(min=self.min_diversity)
+            
+            fake_sorted, _ = features[fake_mask].sort(dim=0)
+            q1 = fake_sorted[n_fake//4]
+            q3 = fake_sorted[min(3*n_fake//4, n_fake-1)]
+            fake_iqr = (q3 - q1).mean().clamp(min=self.min_diversity)
+            
+            self.diversity_ema = (self.ema_decay * self.diversity_ema +
+                                 (1 - self.ema_decay) * (real_iqr + fake_iqr)/2)
+        
+        return loss_tensor.mean()
 
-        # 1. Pull positive pairs together: loss is high when similarity is low.
-        pos_sim = sim_matrix[pos_mask]
-        pos_loss = (1.0 - pos_sim).clamp(min=0).mean()
-        
-        # 2. Push negative pairs apart: loss is high when similarity exceeds a margin.
-        neg_sim = sim_matrix[neg_mask]
-        neg_loss = (neg_sim - self.margin).clamp(min=0).mean()
-        
-        return pos_loss + neg_loss
-
-    def _calculate_distillation_loss(self, feat_teacher: torch.Tensor, feat_student: torch.Tensor) -> torch.Tensor:
-        """
-        Calculates a contrastive knowledge distillation loss (InfoNCE).
-        It encourages the student's feature for a given sample to be most similar
-        to the teacher's feature for that same sample, and dissimilar to the
-        teacher's features for all other samples in the batch.
-        """
-        # L2-normalize both sets of features
-        teacher_norm = F.normalize(feat_teacher, p=2, dim=1)
-        student_norm = F.normalize(feat_student, p=2, dim=1)
-        
-        # Calculate the similarity matrix between student (queries) and teacher (keys)
-        # The goal is to make the diagonal (correct pairs) have the highest scores
-        sim_matrix = torch.matmul(student_norm, teacher_norm.t()) / self.temp
-        
-        # The ground-truth labels are the diagonal indices (0, 1, 2, ...)
-        # because we want student[i] to match teacher[i]
-        batch_size = sim_matrix.size(0)
-        labels = torch.arange(batch_size, device=sim_matrix.device)
-        
-        # Use cross-entropy loss to maximize the scores on the diagonal
-        loss = self.cross_entropy_loss(sim_matrix, labels)
-        return loss
 
     def forward(self, outputs: Dict[str, torch.Tensor], labels: torch.Tensor) -> torch.Tensor:
+        
         # 1. Main classification loss (Essential)
         loss_cls = self.cross_entropy_loss(outputs["final_logits"], labels)
 
-        # 2. Auxiliary loss for the STUDENT branch (Good Regularization)
-        loss_cls_s = self.cross_entropy_loss(outputs["logits_s"], labels)
+        loss_intra_s = self._artifact_contrastive_loss(
+            features=outputs["feat_s"], 
+            labels=labels
+        )
+        loss_attn = 0
+        print(outputs["feat_s"])
 
-        # 3. Knowledge Distillation Loss (CRITICAL)
-        #    Align student features (feat_s) to the static teacher features (feat_w)
-        loss_distill = self._calculate_distillation_loss(outputs["feat_w"].detach(), outputs["feat_s"])
+        temporal_losses = outputs["temporal_losses"].sum()
+        diversity_loss = outputs["diversity_losses"].sum()
+        consistency_loss = outputs["consistency_losses"].sum()
+        print(temporal_losses)
+        print(diversity_loss)
+        print(consistency_loss)
+        loss_attn=(
+                consistency_loss * 0.01 + 
+                diversity_loss * 0.01 +
+                temporal_losses * 0.01
+            )
+                
 
-        # 4. Intra-view loss for the STUDENT branch (Good Regularization)
-        loss_intra_s = self._calculate_intra_view_loss(outputs["feat_s"], labels)
-
-        # --- DO NOT COMPUTE LOSSES FOR THE FROZEN WAV2VEC BRANCH ---
-        # loss_cls_w is useless
-        # loss_inner_w is useless
 
         # Final weighted sum
         total_loss = (self.w_cls * loss_cls +
-                      self.w_cls_s * loss_cls_s +
-                      self.w_distill * loss_distill +
-                      self.w_intra_s * loss_intra_s)
+                      self.w_intra_s * loss_intra_s +
+                      self.w_attn * loss_attn)
+        
+
+        logger.info(f"Loss_cls: {loss_cls.item():.4f}, "
+            f"Loss_intra_s: {loss_intra_s.item():.4f}, "
+            f"Loss_attn: {loss_attn.item():4f},"
+            f"Total_loss: {total_loss.item():.4f}")
         
         return total_loss
 
@@ -554,7 +673,7 @@ def main():
     # --- Data Arguments ---
     parser.add_argument("--metadata_path", type=Path, required=True, help="Path to the CSV metadata file.")
     parser.add_argument("--data_dir", type=Path, required=True, help="Root directory of audio data.")
-    parser.add_argument("--batch_size", type=int, default=16, help="Batch size. May need to be smaller due to model size.")
+    parser.add_argument("--batch_size", type=int, default=32, help="Batch size. May need to be smaller due to model size.")
     parser.add_argument("--epochs", type=int, default=50, help="Number of training epochs.")
     parser.add_argument("--num_workers", type=int, default=4, help="Number of dataloader workers.")
     parser.add_argument("--test_split_ratio", type=float, default=0.2, help="Ratio for test set split.")

@@ -21,14 +21,18 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 
 # collate_fn_skip_none MUST be at the global scope for multiprocessing (num_workers > 0)
 def collate_fn_skip_none(batch):
-    """
-    Collate function that filters out None items from a batch and then uses
-    the default collate function.
-    """
     batch = [item for item in batch if item is not None]
-    if not batch: # If all items were None, or the batch was empty to begin with
+    if not batch:
         return None
-    return torch.utils.data.dataloader.default_collate(batch)
+    # Custom collate because default_collate can't handle dicts of tensors well
+    elem = batch[0]
+    collated_batch = {}
+    for key in elem:
+        if key == 'features':
+            collated_batch[key] = {k: torch.stack([d[key][k] for d in batch]) for k in elem[key]}
+        else:
+            collated_batch[key] = torch.utils.data.dataloader.default_collate([d[key] for d in batch])
+    return collated_batch['features'], collated_batch['labels']
 
 
 class ResidualBlock(nn.Module):
