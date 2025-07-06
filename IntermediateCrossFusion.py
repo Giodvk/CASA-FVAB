@@ -357,6 +357,7 @@ class MultiViewCollaborativeNet(nn.Module):
 
 class CollaborativeLoss(nn.Module):
     def __init__(self, 
+                 class_weights: Optional[torch.Tensor] = None,
                  w_cls: float = 1.0,      # Weight for final classification
                  w_intra_s: float = 0.6,  # Weight for student's metric learning (inner-view)
                  w_attn: float = 0.2,
@@ -366,7 +367,9 @@ class CollaborativeLoss(nn.Module):
                  min_diversity: float = 0.01,
                  focus_factor: float =5.0):
         super().__init__()
-        self.cross_entropy_loss = nn.CrossEntropyLoss()
+        if class_weights is not None:
+            logger.info("CollaborativeLoss: Initializing with class weights for CrossEntropyLoss.")
+        self.cross_entropy_loss = nn.CrossEntropyLoss(weight=class_weights)
         
         # Pesi per bilanciare le componenti della loss
         self.w_cls = w_cls           # Peso per la classificazione principale
@@ -500,9 +503,7 @@ class CollaborativeLoss(nn.Module):
         temporal_losses = outputs["temporal_losses"].sum()
         diversity_loss = outputs["diversity_losses"].sum()
         consistency_loss = outputs["consistency_losses"].sum()
-        print(temporal_losses)
-        print(diversity_loss)
-        print(consistency_loss)
+
         loss_attn=(
                 consistency_loss * 0.01 + 
                 diversity_loss * 0.01 +
@@ -517,10 +518,7 @@ class CollaborativeLoss(nn.Module):
                       self.w_attn * loss_attn)
         
 
-        logger.info(f"Loss_cls: {loss_cls.item():.4f}, "
-            f"Loss_intra_s: {loss_intra_s.item():.4f}, "
-            f"Loss_attn: {loss_attn.item():4f},"
-            f"Total_loss: {total_loss.item():.4f}")
+
         
         return total_loss
 

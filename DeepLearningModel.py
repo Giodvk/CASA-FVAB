@@ -19,6 +19,17 @@ from split_dataset import train_speaker, test_speaker
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
+
+if torch.cuda.is_available():
+    device = torch.device("cuda")
+elif torch.backends.mps.is_available():
+    # Controlla se MPS è disponibile E costruito per la tua versione di PyTorch
+    device = torch.device("mps")
+
+else:
+    device = torch.device("cpu")
+    logger.info(f"Using device: {device}")
+
 # collate_fn_skip_none MUST be at the global scope for multiprocessing (num_workers > 0)
 def collate_fn_skip_none(batch):
     batch = [item for item in batch if item is not None]
@@ -320,7 +331,7 @@ def main():
     args = parser.parse_args()
 
     logger.info(f"Starting deepfake detection training with args: {args}")
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+   
     logger.info(f"Using device: {device}")
     
     if args.num_workers > 0 and device.type == 'cuda':

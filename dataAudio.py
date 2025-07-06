@@ -222,3 +222,125 @@ class DeepfakeDataset(torch.utils.data.Dataset): # Renamed from SpeakerDataset
 
     def __len__(self) -> int:
         return len(self.samples)
+    
+
+
+
+
+class DeepfakeASVDataset(torch.utils.data.Dataset):
+    def __init__(
+            self,
+            root_dir: Path,
+            metadata_path: Path,
+            mode: str, # NEW: 'train' or 'eval' to handle different metadata formats
+            processor: AudioProcessor,
+            augment: bool = False,
+    ):
+        self.root_dir = root_dir
+        self.metadata_path = metadata_path
+        self.processor = processor
+        self.augment = augment
+
+        if mode not in ['train', 'eval']:
+            raise ValueError(f"Mode must be 'train' or 'eval', but got '{mode}'")
+        self.mode = mode
+
+        # Map labels to integers. Handles 'bonafide' and 'spoof'.
+        self.label_map = {'bonafide': 0, 'spoof': 1}
+        
+        self.samples = self._load_samples()
+        if not self.samples:
+            logger.warning(f"No audio samples found based on metadata in {metadata_path}. Dataset is empty.")
+        
+        self._init_augmentations()
+
+    def _load_samples(self) -> List[Dict]:
+        """
+        Parses the ASVspoof2019 metadata file and creates a list of samples.
+        """
+        samples = []
+        logger.info(f"Loading samples for mode: '{self.mode}' from {self.metadata_path}")
+        
+        with open(self.metadata_path, 'r') as f:
+            for line in f:
+                parts = line.strip().split()
+                
+                # Skip empty or malformed lines
+                if not parts:
+                    continue
+
+                filename_stem = ""
+                label_str = ""
+
+                # Parse line based on the mode
+                if self.mode == 'train':
+                    # Format: LA_0079 LA_T_1138215 - - bonafide
+                    if len(parts) < 5:
+                        logger.warning(f"Skipping malformed train line: '{line.strip()}'")
+                        continue
+                    filename_stem = parts[1]
+                    label_str = parts[4]
+                
+                elif self.mode == 'eval':
+                    # Format: LA_0009 LA_E_9332881 alaw ita_tx A07 spoof notrim eval
+                    if len(parts) < 6:
+                        logger.warning(f"Skipping malformed eval line: '{line.strip()}'")
+                        continue
+                    filename_stem = parts[1]
+                    label_str = parts[5]
+
+                # Construct the full path to the .flac file
+                audio_path = self.root_dir / f"{filename_stem}.flac"
+
+                if not audio_path.exists():
+                    logger.warning(f"Audio file {audio_path} not found. Skipping.")
+                    continue
+                
+                # Convert string label to integer
+                if label_str not in self.label_map:
+                    logger.warning(f"Unknown label '{label_str}' in line: {line.strip()}. Skipping.")
+                    continue
+                
+                label = self.label_map[label_str]
+                
+                samples.append({
+                    "path": audio_path,
+                    "label": label
+                    # We no longer need the speaker ID, but you could add it if needed:
+                    # "speaker": parts[0] 
+                })
+        
+        logger.info(f"Successfully loaded {len(samples)} samples.")
+        return samples
+
+    def _init_augmentations(self):
+        self.spec_augment_chain = None
+        if self.augment:
+            self.spec_augment_chain = torch.nn.Sequential(
+                torchaudio.transforms.FrequencyMasking(freq_mask_param=self.processor.config.n_mels // 8),
+                torchaudio.transforms.TimeMasking(time_mask_param=35)
+            )
+
+    def __getitem__(self, idx: int) -> Optional[Dict[str, torch.Tensor]]:
+        if idx >= len(self.samples):
+            raise IndexError("Index out of bounds")
+
+        sample_info = self.samples[idx]
+        waveform = self.processor.load_audio(sample_info["path"])
+
+        if waveform.numel() == 0:
+            logger.warning(f"Skipping sample {sample_info['path']} due to loading error. Returning None.")
+            # Note: Your DataLoader's collate_fn should handle None values, e.g., by filtering them out.
+            return None
+
+        features = self.processor.extract_features(waveform)
+
+        if self.augment and self.spec_augment_chain is not None:
+            features["mel"] = self.spec_augment_chain(features["mel"].unsqueeze(0)).squeeze(0)
+
+        deepfake_label = sample_info["label"]
+        
+        return {"features": features, "labels": torch.tensor(deepfake_label, dtype=torch.long)}
+
+    def __len__(self) -> int:
+        return len(self.samples)

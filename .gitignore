@@ -11,4 +11,6 @@
 # Ignore output folders
 /release_in_the_wild/
 /processed_audio/
+/LA/
+/ASVspoof2021_LA_eval/
 

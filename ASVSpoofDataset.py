@@ -4,7 +4,6 @@ import pandas as pd
 import numpy as np
 import torch
 import torchaudio
-from pydub import AudioSegment
 from torch.utils.data import DataLoader
 from dataAudio import AudioProcessor
 from sklearn.metrics import accuracy_score, roc_auc_score, roc_curve, classification_report
@@ -122,17 +121,6 @@ class ASVspoofDataset(torch.utils.data.Dataset):
 
 
 
-def calculate_eer(y_true, y_scores_positive_class):
-    """
-    Calcola l'Equal Error Rate (EER).
-    y_true: Etichette binarie vere (0 o 1).
-    y_scores_positive_class: Score del modello per la classe positiva (es. 'spoof').
-    """
-    fpr, tpr, thresholds = roc_curve(y_true, y_scores_positive_class, pos_label=1)  # Assumiamo 1 = spoof
-    fnr = 1 - tpr
-    eer_index = np.nanargmin(np.abs(fnr - fpr))
-    eer_value = (fpr[eer_index] + fnr[eer_index]) / 2
-    return eer_value * 100  # Riportato come percentuale
 
 
 def CreateCSVASVSpoof(pathKey):
@@ -149,21 +137,6 @@ def CreateCSVASVSpoof(pathKey):
     return pd.DataFrame(data)
 
 
-def convert_flac_to_wav_inplace(input_dir: Path):
-    input_dir = Path(input_dir)
-
-    for flac_file in input_dir.rglob("*.flac"):
-        try:
-            print(f"Converting: {flac_file}")
-            audio = AudioSegment.from_file(flac_file, format="flac")
-
-            wav_path = flac_file.with_suffix('.wav')
-            audio.export(wav_path, format="wav")
-
-            flac_file.unlink()  # rimuove il file .flac originale
-            print(f" Converted and replaced: {flac_file.name}")
-        except Exception as e:
-            print(f" Failed to convert {flac_file}: {e}")
 
 
 
