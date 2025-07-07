@@ -196,6 +196,7 @@ class DeepfakeDataset(torch.utils.data.Dataset): # Renamed from SpeakerDataset
                 torchaudio.transforms.FrequencyMasking(freq_mask_param=self.processor.config.n_mels // 8),
                 torchaudio.transforms.TimeMasking(time_mask_param=35)
             )
+            self.raw_boost_augment = RawBoost(sample_rate=self.processor.config.sample_rate)
 
     def __getitem__(self, idx: int) -> Optional[Dict[str, torch.Tensor]]: # <-- Return type changed for clarity
         if idx >= len(self.samples):
@@ -207,6 +208,9 @@ class DeepfakeDataset(torch.utils.data.Dataset): # Renamed from SpeakerDataset
         if waveform.numel() == 0:
             logger.warning(f"Skipping sample {sample_info['path']}. Returning None.")
             return None
+        
+        if self.augment and self.raw_boost_augment is not None:
+            waveform = self.raw_boost_augment(waveform)
 
         # This now returns a dict with "mel" and "wav2vec_input"
         features = self.processor.extract_features(waveform)
@@ -244,21 +248,20 @@ class RawBoost:
         self.sample_rate = sample_rate
         # Define ranges for random parameters as per the paper (Table 1)
         self.n_fir_coeffs = [10, 100]  # Range for Nfir
-        self.n_notches = [1, 5]        # Range for Nnotch
         self.freq_lims = [20, 8000]     # Range for fc
-        self.bw_lims = [10, 1000]      # Range for Δf
+        self.bw_lims = [100, 1000]      # Range for Δf
         self.snr_lims = [15, 35]       # Range for SNR (dB) for additive noise
         
         self.gcn_lims_db = [-5, -20]   # Range for gcn_2 to gcn_Nf (dB)
         self.n_nonlinear_order = 5     # Nf
 
-        self.prel_lims = [0.01, 0.20]  # Range for Prel (%) for impulsive noise
+        self.prel_lims = [0.01, 0.10]  # Range for Prel (%) for impulsive noise
         self.gsd_db = 2                # Gain for impulsive noise (dB)
 
     def _design_random_fir_filter(self):
         """Designs a random FIR filter with multiple notches."""
         n_coeffs = np.random.randint(self.n_fir_coeffs[0], self.n_fir_coeffs[1])
-        n_notches = np.random.randint(self.n_notches[0], self.n_notches[1] + 1)
+        n_notches = 5
         
         notch_freqs = np.random.uniform(self.freq_lims[0], self.freq_lims[1], n_notches)
         notch_bws = np.random.uniform(self.bw_lims[0], self.bw_lims[1], n_notches)
@@ -310,6 +313,16 @@ class RawBoost:
             
         return y
 
+    def _get_impulsive_random_values(self, num_samples):
+        """Generates random values from a distribution similar to f(r) = -log(|r|)"""
+        # Start with a uniform distribution in (0, 1]
+        u = np.random.uniform(low=1e-6, high=1.0, size=num_samples)
+        # Transform to get the desired shape (more small values)
+        # r = exp(-u*k) where k controls the skew. Let's use k=5 for a strong skew.
+        r = np.exp(-u * 5) 
+        # Randomly assign sign
+        signs = np.random.choice([-1, 1], size=num_samples)
+        return r * signs
     def _process2_impulsive(self, x: np.ndarray) -> np.ndarray:
         """Applies signal-dependent additive impulsive noise."""
         y = x.copy()
@@ -324,7 +337,8 @@ class RawBoost:
         
         # Generate random values for the noise impulse
         # The paper's distribution is complex. A uniform distribution is a reasonable simplification.
-        random_values = np.random.uniform(-1, 1, size=n_samples_to_corrupt)
+        random_values = self._get_impulsive_random_values(n_samples_to_corrupt)
+
         gain = db_to_linear(self.gsd_db)
         
         noise = gain * random_values * x[indices]
@@ -379,15 +393,15 @@ class RawBoost:
         # The paper's best result was a series of 1 and 2. Let's prioritize that.
         
         # Apply Process 1 (Convolutional)
-        if np.random.rand() < 0.8: # Apply with 80% probability
+        if np.random.rand() < 0.3: # Apply with 30% probability
             x = self._process1_convolutional(x)
 
         # Apply Process 2 (Impulsive)
-        if np.random.rand() < 0.8: # Apply with 80% probability
+        if np.random.rand() < 0.3: # Apply with 30% probability
             x = self._process2_impulsive(x)
 
         # Apply Process 3 (Additive)
-        if np.random.rand() < 0.8: # Apply with 80% probability
+        if np.random.rand() < 0.0: # Apply with 0% probability
             x = self._process3_additive(x)
             
         # Final normalization to prevent clipping/overflow
