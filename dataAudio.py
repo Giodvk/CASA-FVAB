@@ -224,7 +224,180 @@ class DeepfakeDataset(torch.utils.data.Dataset): # Renamed from SpeakerDataset
         return len(self.samples)
     
 
+# raw_boost.py
+import numpy as np
+import scipy.signal
+import torch
+from typing import List
 
+# A small utility to convert dB to linear scale
+def db_to_linear(db_value):
+    return 10**(db_value / 20.0)
+
+class RawBoost:
+    """
+    Implementation of the RawBoost data augmentation algorithm.
+    Based on the paper: "RawBoost: A Raw Data Boosting and Augmentation Method..."
+    https://www.isca-speech.org/archive/interspeech_2020/tak20_interspeech.html
+    """
+    def __init__(self, sample_rate=16000):
+        self.sample_rate = sample_rate
+        # Define ranges for random parameters as per the paper (Table 1)
+        self.n_fir_coeffs = [10, 100]  # Range for Nfir
+        self.n_notches = [1, 5]        # Range for Nnotch
+        self.freq_lims = [20, 8000]     # Range for fc
+        self.bw_lims = [10, 1000]      # Range for Δf
+        self.snr_lims = [15, 35]       # Range for SNR (dB) for additive noise
+        
+        self.gcn_lims_db = [-5, -20]   # Range for gcn_2 to gcn_Nf (dB)
+        self.n_nonlinear_order = 5     # Nf
+
+        self.prel_lims = [0.01, 0.20]  # Range for Prel (%) for impulsive noise
+        self.gsd_db = 2                # Gain for impulsive noise (dB)
+
+    def _design_random_fir_filter(self):
+        """Designs a random FIR filter with multiple notches."""
+        n_coeffs = np.random.randint(self.n_fir_coeffs[0], self.n_fir_coeffs[1])
+        n_notches = np.random.randint(self.n_notches[0], self.n_notches[1] + 1)
+        
+        notch_freqs = np.random.uniform(self.freq_lims[0], self.freq_lims[1], n_notches)
+        notch_bws = np.random.uniform(self.bw_lims[0], self.bw_lims[1], n_notches)
+        
+        # Create frequency bands to keep (everything except the notches)
+        bands = [0]
+        for f, bw in zip(notch_freqs, notch_bws):
+            bands.extend([f - bw/2, f + bw/2])
+        bands.append(self.sample_rate / 2)
+        
+        # Define desired gains for each band (1 for passbands, 0 for stopbands)
+        desired = []
+        for i in range(len(bands) // 2):
+            desired.extend([1, 0])
+        if len(bands) % 2 != 0:
+            desired.append(1)
+            
+        # Normalize frequencies to Nyquist
+        bands = np.array(bands) / (self.sample_rate / 2.0)
+        
+        # Ensure bands are within [0, 1] and sorted
+        bands = np.clip(bands, 0, 1)
+        bands = np.sort(bands)
+        
+        # Design the filter
+        try:
+            # firwin2 is great for arbitrary frequency response shapes
+            fir_coeffs = scipy.signal.firwin2(n_coeffs, bands, desired)
+            return fir_coeffs
+        except ValueError:
+            # Fallback to a simpler filter if firwin2 fails (e.g., due to bad random params)
+            return scipy.signal.firwin(n_coeffs, cutoff=0.5, window='hamming')
+
+
+    def _process1_convolutional(self, x: np.ndarray) -> np.ndarray:
+        """Applies linear and non-linear convolutional noise."""
+        y = np.zeros_like(x)
+        
+        # Linear part (j=1)
+        filter_coeffs = self._design_random_fir_filter()
+        y += scipy.signal.lfilter(filter_coeffs, 1, x)
+        
+        # Non-linear part (j=2 to Nf)
+        for j in range(2, self.n_nonlinear_order + 1):
+            filter_coeffs = self._design_random_fir_filter()
+            gain = db_to_linear(np.random.uniform(self.gcn_lims_db[0], self.gcn_lims_db[1]))
+            # Apply filter to the powered signal
+            y += gain * scipy.signal.lfilter(filter_coeffs, 1, x**j)
+            
+        return y
+
+    def _process2_impulsive(self, x: np.ndarray) -> np.ndarray:
+        """Applies signal-dependent additive impulsive noise."""
+        y = x.copy()
+        
+        prel = np.random.uniform(self.prel_lims[0], self.prel_lims[1])
+        n_samples_to_corrupt = int(prel * len(x))
+        
+        if n_samples_to_corrupt == 0:
+            return y
+            
+        indices = np.random.choice(len(x), n_samples_to_corrupt, replace=False)
+        
+        # Generate random values for the noise impulse
+        # The paper's distribution is complex. A uniform distribution is a reasonable simplification.
+        random_values = np.random.uniform(-1, 1, size=n_samples_to_corrupt)
+        gain = db_to_linear(self.gsd_db)
+        
+        noise = gain * random_values * x[indices]
+        y[indices] += noise
+        
+        return y
+
+    def _process3_additive(self, x: np.ndarray) -> np.ndarray:
+        """Applies signal-independent stationary additive noise."""
+        # Generate white noise
+        white_noise = np.random.randn(len(x))
+        
+        # Color the noise with a random filter
+        filter_coeffs = self._design_random_fir_filter()
+        colored_noise = scipy.signal.lfilter(filter_coeffs, 1, white_noise)
+        
+        # Pick a random SNR
+        snr_db = np.random.uniform(self.snr_lims[0], self.snr_lims[1])
+        
+        # Calculate signal and noise power
+        signal_power = np.sum(x**2)
+        noise_power = np.sum(colored_noise**2)
+        
+        if noise_power == 0: # Avoid division by zero
+            return x
+
+        # Calculate gain to achieve the target SNR
+        # SNR_db = 10 * log10(P_signal / P_noise)
+        # P_noise_target = P_signal / 10^(SNR_db/10)
+        # gain^2 * P_noise_current = P_noise_target
+        # gain = sqrt(P_noise_target / P_noise_current)
+        gain = np.sqrt(signal_power / (noise_power * (10**(snr_db/10))))
+        
+        y = x + gain * colored_noise
+        return y
+
+    def __call__(self, waveform: torch.Tensor) -> torch.Tensor:
+        """
+        Applies the full RawBoost augmentation pipeline.
+        The paper found that a series of (1) and (2) was effective.
+        We can randomly choose a combination of the three.
+        """
+        # Convert to numpy, ensure it's a 1D array
+        original_shape = waveform.shape
+        # Ensure we are working with a 1D numpy array for processing
+        x = waveform.numpy().squeeze()
+        if x.ndim > 1: # Defensive check
+            x = x.flatten()
+        
+        # Randomly choose which augmentations to apply
+        # This adds more variety than applying all three every time.
+        # The paper's best result was a series of 1 and 2. Let's prioritize that.
+        
+        # Apply Process 1 (Convolutional)
+        if np.random.rand() < 0.8: # Apply with 80% probability
+            x = self._process1_convolutional(x)
+
+        # Apply Process 2 (Impulsive)
+        if np.random.rand() < 0.8: # Apply with 80% probability
+            x = self._process2_impulsive(x)
+
+        # Apply Process 3 (Additive)
+        if np.random.rand() < 0.8: # Apply with 80% probability
+            x = self._process3_additive(x)
+            
+        # Final normalization to prevent clipping/overflow
+        max_val = np.abs(x).max()
+        if max_val > 0:
+            x = x / max_val
+
+        augmented_x = torch.from_numpy(x).float() 
+        # Convert back to a torch tensor with a channel dimension
+        return augmented_x.view(original_shape)
 
 
 class DeepfakeASVDataset(torch.utils.data.Dataset):
@@ -315,11 +488,15 @@ class DeepfakeASVDataset(torch.utils.data.Dataset):
 
     def _init_augmentations(self):
         self.spec_augment_chain = None
+        self.raw_boost_augment = None # Initialize to None
         if self.augment:
+            # Your existing spectrogram augmentation
             self.spec_augment_chain = torch.nn.Sequential(
                 torchaudio.transforms.FrequencyMasking(freq_mask_param=self.processor.config.n_mels // 8),
                 torchaudio.transforms.TimeMasking(time_mask_param=35)
             )
+            # NEW: Initialize RawBoost for waveform augmentation
+            self.raw_boost_augment = RawBoost(sample_rate=self.processor.config.sample_rate)
 
     def __getitem__(self, idx: int) -> Optional[Dict[str, torch.Tensor]]:
         if idx >= len(self.samples):
@@ -333,6 +510,9 @@ class DeepfakeASVDataset(torch.utils.data.Dataset):
             # Note: Your DataLoader's collate_fn should handle None values, e.g., by filtering them out.
             return None
 
+        if self.augment and self.raw_boost_augment is not None:
+            waveform = self.raw_boost_augment(waveform)
+            
         features = self.processor.extract_features(waveform)
 
         if self.augment and self.spec_augment_chain is not None:
