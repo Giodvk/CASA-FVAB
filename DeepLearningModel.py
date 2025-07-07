@@ -149,7 +149,7 @@ def train(
         epochs: int = 50,
         save_path: str = "best_model_deepfake.pth"  # Add save_path parameter
 ) -> Dict[str, List[float]]:
-    best_val_acc = 0.0
+    best_val_eer = 1.0
     metrics = {
         "train_loss": [], "val_loss": [],
         "train_acc": [], "val_acc": [],
@@ -215,14 +215,14 @@ def train(
             )
             
             # Save best model based on validation accuracy
-            if val_acc > best_val_acc:
-                best_val_acc = val_acc
+            if val_eer < best_val_eer:
+                best_val_eer = val_eer
                 torch.save(model.state_dict(), save_path)
-                logger.info(f"New best model saved with validation accuracy: {val_acc:.4f}")
+                logger.info(f"New best model saved with validation EER: {val_eer:.4f}")
             
             # Update scheduler with validation accuracy
             if scheduler and isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-                scheduler.step(val_acc)
+                scheduler.step(val_loss)
         else:
             logger.info(f"Epoch {epoch}/{epochs-1} Summary: Train Loss: {avg_epoch_train_loss:.4f}, Train Acc: {avg_epoch_train_acc:.4f} | No validation.")
             metrics["val_acc"].append(0.0)
@@ -234,7 +234,7 @@ def train(
             if scheduler and not isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
                 scheduler.step()
 
-    logger.info(f"Training finished. Best Validation Accuracy: {best_val_acc:.4f}")
+    logger.info(f"Training finished. Best Validation EER: {best_val_eer:.4f}")
     return metrics
 
 def evaluate(
@@ -456,7 +456,7 @@ def main():
     logger.info(f"Model trainable parameters: {num_params:,}")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="max", factor=0.1, patience=5)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.1, patience=5)
     criterion = nn.CrossEntropyLoss() # Suitable for binary classification (2 classes)
 
     train_loader = torch.utils.data.DataLoader(
