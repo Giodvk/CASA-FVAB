@@ -1,17 +1,13 @@
 from pathlib import Path
-
+from IntermediateCrossFusion import collate_fn_skip_none
 import numpy as np
-import pandas as pd
+from split_dataset import balanced_asv
 from sklearn.metrics import accuracy_score, roc_auc_score, classification_report
 from torch.utils.data import DataLoader
 from dataAudio import AudioConfig
 from ASVSpoofDataset import ASVspoofDataset, calculate_eer, CreateCSVASVSpoof, ASVSpoofProcessor
-
 import torch
-
-from models.LightCNNRNN import LightCNNRNN
-from models.Wav2Vec import Wav2VecClassifier
-
+from IntermediateCrossFusion import MultiViewCollaborativeNet
 
 def testOnASVspoof(model,
                    asv_csv_path,
@@ -55,6 +51,7 @@ def testOnASVspoof(model,
         eval_dataset,
         batch_size=batch_size,
         shuffle=False,
+        collate_fn=collate_fn_skip_none
     )
     all_true_labels = []
     all_predicted_classes = []
@@ -63,17 +60,19 @@ def testOnASVspoof(model,
     print(f"Inizio valutazione su {len(eval_dataset)} campioni...")
     with torch.no_grad():  # Disabilita il calcolo dei gradienti
         for i, (batch_features, batch_true_labels) in enumerate(eval_dataloader):
-            model_outputs = model(batch_features.to(device))  # Output raw del modello (logits)
+            wav2vec_features = batch_features['wav2vec_input'].squeeze(1).to(device)
+            model_outputs = model(x_wav2vec_input=wav2vec_features,
+                                  x_spec=batch_features['mel'].to(device))  # Output raw del modello (logits)
 
-            if model_outputs.ndim > 1 and model_outputs.shape[1] == 2:
-                probabilities = torch.softmax(model_outputs, dim=1)
+            if model_outputs['final_logits'].ndim > 1 and model_outputs['final_logits'].shape[1] == 2:
+                probabilities = torch.softmax(model_outputs['final_logits'], dim=1)
 
                 scores_for_spoof_class = probabilities[:, current_label_mapping.get('spoof', 1)]
                 _, predicted_batch_classes = torch.max(probabilities, dim=1)
 
-            elif model_outputs.ndim == 1 or (model_outputs.ndim == 2 and model_outputs.shape[1] == 1):
+            elif model_outputs['final_logits'].ndim == 1 or (model_outputs.ndim == 2 and model_outputs['final_logits'].shape[1] == 1):
                 model_outputs = model_outputs.squeeze()  # Assicura sia 1D
-                scores_for_spoof_class = torch.sigmoid(model_outputs)  # Probabilità
+                scores_for_spoof_class = torch.sigmoid(model_outputs['final_logits'])  # Probabilità
                 predicted_batch_classes = (scores_for_spoof_class > 0.5).long()
             else:
                 raise ValueError(
@@ -130,18 +129,15 @@ def testOnASVspoof(model,
 if __name__ == '__main__':
     eval_path = Path('B:/4835108/ASVspoof2021_DF_eval_part00/ASVspoof2021_DF_eval/flac')
     pathKey = 'C:/Users/dmc/PycharmProjects/CASA-FVAB/trial_metadata.txt'
+    wav2_vec2_input = "C:\\Users\dmc\PycharmProjects\CASA-FVAB\wav2vec2-xlsr"
 
     # convert_flac_to_wav_inplace(eval_path)
 
     df = CreateCSVASVSpoof(pathKey)
     df.to_csv("ASVSpoofData.csv", index=False, columns=['file', 'label'])
     config = AudioConfig()
-    processor = ASVSpoofProcessor(config=config, target=5)
-    cnn_rnn = Wav2VecClassifier().to(device="cuda")
-    cnn_rnn.load_state_dict(torch.load("C:/Users/dmc/PycharmProjects/CASA-FVAB/saved_models/wav2vec_model.pth",
+    processor = ASVSpoofProcessor(config=config, target=5, wav2vec_model_name=wav2_vec2_input)
+    fused_model = MultiViewCollaborativeNet('C:\\Users\dmc\PycharmProjects\CASA-FVAB\wav2vec2-xlsr').to(device="cuda")
+    fused_model.load_state_dict(torch.load("C:\\Users\dmc\PycharmProjects\CASA-FVAB\\best_collaborative_model2.pth",
                                        map_location="cuda"))
-    prova = df[:152956]
-    spoof = prova[prova['label'] == 'spoof']
-    bona = prova[prova['label'] == 'bona-fide']
-    final = pd.concat([bona, spoof[:5536]])
-    testOnASVspoof(cnn_rnn, final, eval_path, processor)
+    testOnASVspoof(fused_model, balanced_asv, eval_path, processor)

@@ -75,21 +75,21 @@ class network_9layers(nn.Module):
 class network_29layers(nn.Module):
     def __init__(self, block, layers, num_classes=79077):
         super(network_29layers, self).__init__()
-        self.conv1  = mfm(1, 48, 5, 1, 2)
-        self.pool1  = nn.MaxPool2d(kernel_size=2, stride=2, ceil_mode=True)
+        self.conv1 = mfm(1, 48, 5, 1, 2)
+        self.pool1 = nn.MaxPool2d(kernel_size=2, stride=2, ceil_mode=True)
         self.block1 = self._make_layer(block, layers[0], 48, 48)
         self.group1 = group(48, 96, 3, 1, 1)
-        self.pool2  = nn.MaxPool2d(kernel_size=2, stride=2, ceil_mode=True)
+        self.pool2 = nn.MaxPool2d(kernel_size=2, stride=2, ceil_mode=True)
         self.block2 = self._make_layer(block, layers[1], 96, 96)
         self.group2 = group(96, 192, 3, 1, 1)
-        self.pool3  = nn.MaxPool2d(kernel_size=2, stride=2, ceil_mode=True)
+        self.pool3 = nn.MaxPool2d(kernel_size=2, stride=2, ceil_mode=True)
         self.block3 = self._make_layer(block, layers[2], 192, 192)
         self.group3 = group(192, 128, 3, 1, 1)
         self.block4 = self._make_layer(block, layers[3], 128, 128)
         self.group4 = group(128, 128, 3, 1, 1)
-        self.pool4  = nn.MaxPool2d(kernel_size=2, stride=2, ceil_mode=True)
-        self.fc     = mfm(8*8*128, 256, type=0)
-        self.fc2    = nn.Linear(256, num_classes)
+        self.pool4 = nn.MaxPool2d(kernel_size=2, stride=2, ceil_mode=True)
+        self.fc = mfm(8*8*128, 256, type=0)
+        self.fc2 = nn.Linear(256, num_classes)
             
     def _make_layer(self, block, num_blocks, in_channels, out_channels):
         layers = []
@@ -125,16 +125,16 @@ class network_29layers(nn.Module):
 class network_29layers_v2(nn.Module):
     def __init__(self, block, layers, num_classes=79077):
         super(network_29layers_v2, self).__init__()
-        self.conv1    = mfm(1, 48, 5, 1, 2)
-        self.block1   = self._make_layer(block, layers[0], 48, 48)
-        self.group1   = group(48, 96, 3, 1, 1)
-        self.block2   = self._make_layer(block, layers[1], 96, 96)
-        self.group2   = group(96, 192, 3, 1, 1)
-        self.block3   = self._make_layer(block, layers[2], 192, 192)
-        self.group3   = group(192, 128, 3, 1, 1)
-        self.block4   = self._make_layer(block, layers[3], 128, 128)
-        self.group4   = group(128, 128, 3, 1, 1)
-        self.fc       = nn.Linear(8*8*128, 256)
+        self.conv1 = mfm(1, 48, 5, 1, 2)
+        self.block1 = self._make_layer(block, layers[0], 48, 48)
+        self.group1 = group(48, 96, 3, 1, 1)
+        self.block2 = self._make_layer(block, layers[1], 96, 96)
+        self.group2 = group(96, 192, 3, 1, 1)
+        self.block3 = self._make_layer(block, layers[2], 192, 192)
+        self.group3 = group(192, 128, 3, 1, 1)
+        self.block4 = self._make_layer(block, layers[3], 128, 128)
+        self.group4 = group(128, 128, 3, 1, 1)
+        self.fc = nn.Linear(8*8*128, 256)
         self.fc2 = nn.Linear(256, num_classes, bias=False)
             
     def _make_layer(self, block, num_blocks, in_channels, out_channels):
@@ -159,7 +159,7 @@ class network_29layers_v2(nn.Module):
         x = self.group3(x)
         x = self.block4(x)
         x = self.group4(x)
-        x = F.max_pool2d(x, (2,1),(2,1))
+        x = F.max_pool2d(x, 2)
 
         x = x.view(x.size(0), -1)
         fc = self.fc(x)

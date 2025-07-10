@@ -1,25 +1,13 @@
-import logging
-from typing import List, Optional, Dict, Tuple
-from split_dataset import train_speaker, test_speaker
+from sklearn.model_selection import train_test_split
+from split_dataset import train_speaker, test_speaker, asv_balanced
 from transformers import Wav2Vec2Model
-import argparse
-from pathlib import Path
-import numpy as np
-import pandas as pd
-import torch
-import torch.nn as nn
-from scipy.optimize import brentq
-from scipy.interpolate import interp1d
-from sklearn.metrics import roc_curve, precision_recall_fscore_support
 import torch.nn.functional as F
-
 from dataAudio import AudioConfig, AudioProcessor, DeepfakeDataset
-
 import argparse
+from ASVSpoofDataset import ASVspoofDataset, ASVSpoofProcessor
 import logging
 from pathlib import Path
 from typing import Optional, Dict, List, Tuple
-
 import numpy as np
 import pandas as pd
 import torch
@@ -120,13 +108,6 @@ class CrossAttention(nn.Module):
             'keys': key        # Original keys
         }
 
-
-import torch
-import torch.nn as nn
-from typing import Tuple
-
-# Assume you have a CrossAttention module defined somewhere that might return a tuple
-# e.g., class CrossAttention(nn.Module): ...
 
 class WSFM(nn.Module):
     """
@@ -356,7 +337,7 @@ class MultiViewCollaborativeNet(nn.Module):
 # ===================================================================
 
 class CollaborativeLoss(nn.Module):
-    def __init__(self, 
+    def __init__(self,
                  class_weights: Optional[torch.Tensor] = None,
                  w_cls: float = 1.0,      # Weight for final classification
                  w_intra_s: float = 0.6,  # Weight for student's metric learning (inner-view)
@@ -388,8 +369,7 @@ class CollaborativeLoss(nn.Module):
         self.register_buffer('diversity_ema', torch.tensor(0.5))
         self.register_buffer('initialized', torch.tensor(False))
         
-        
-        
+
         # Parametri per la loss metrica (precedentemente inner-view)
 
 
@@ -498,33 +478,27 @@ class CollaborativeLoss(nn.Module):
             labels=labels
         )
         loss_attn = 0
-        print(outputs["feat_s"])
 
         temporal_losses = outputs["temporal_losses"].sum()
         diversity_loss = outputs["diversity_losses"].sum()
         consistency_loss = outputs["consistency_losses"].sum()
-
         loss_attn=(
                 consistency_loss * 0.01 + 
                 diversity_loss * 0.01 +
                 temporal_losses * 0.01
             )
-                
-
 
         # Final weighted sum
         total_loss = (self.w_cls * loss_cls +
                       self.w_intra_s * loss_intra_s +
                       self.w_attn * loss_attn)
         
-
-
-        
         return total_loss
 
 # ===================================================================
 #  4. Updated Training & Evaluation Loops
 # ===================================================================
+
 
 def collate_fn_skip_none(batch):
     batch = [item for item in batch if item is not None]
@@ -536,8 +510,12 @@ def collate_fn_skip_none(batch):
     for key in elem:
         if key == 'features':
             collated_batch[key] = {k: torch.stack([d[key][k] for d in batch]) for k in elem[key]}
+            if collated_batch['features']['wav2vec_input'].shape != 2:
+                collated_batch['features']['wav2vec_input'] = collated_batch['features']['wav2vec_input'].squeeze(1)
         else:
             collated_batch[key] = torch.utils.data.dataloader.default_collate([d[key] for d in batch])
+            if collated_batch['features']['wav2vec_input'].shape != 2:
+                collated_batch['features']['wav2vec_input'] = collated_batch['features']['wav2vec_input'].squeeze(1)
     return collated_batch['features'], collated_batch['labels']
 
 
@@ -616,6 +594,19 @@ def train_collaborative(
     logger.info(f"Training finished. Best Validation EER: {best_val_eer:.4f}")
     return metrics
 
+def train_On_ASVspoof2021(dataset, batch_size, num_workers):
+    train_dataset, valid_dataset = train_test_split(dataset, test_size=0.2, random_state=42)
+    config = AudioConfig()
+    asv_processor = ASVSpoofProcessor(config, wav2vec_model_name="C:\\Users\dmc\PycharmProjects\CASA-FVAB\wav2vec2-xlsr")
+    asv_train = ASVspoofDataset("", train_dataset, 5, asv_processor, "train")
+    asv_valid = ASVspoofDataset("", valid_dataset, 5, asv_processor, "eval")
+
+    train_loader = torch.utils.data.DataLoader(asv_train, batch_size=batch_size, shuffle=True,
+                                               num_workers= num_workers, collate_fn=collate_fn_skip_none)
+    valid_loader = torch.utils.data.DataLoader(asv_valid, batch_size=batch_size, shuffle=False,
+                                               num_workers=num_workers, collate_fn=collate_fn_skip_none)
+
+    return train_loader, valid_loader
 
 def evaluate_collaborative(
         model: MultiViewCollaborativeNet,
@@ -689,50 +680,56 @@ def main():
 
     logger.info(f"Starting multi-view collaborative training with args: {args}")
     logger.info(f"Using device: {device}")
+
+    train_loader, test_loader = None, None
     
     # Set multiprocessing start method for CUDA
     if args.num_workers > 0 and device.type == 'cuda':
         if torch.multiprocessing.get_start_method(allow_none=True) != 'spawn':
             torch.multiprocessing.set_start_method('spawn', force=True)
+    print("Inserire Dataset d'addestramento: 0(In_The_Wild), 1(ASVspoof2021)")
+    match = int(input())
+    if match == 0:
+        # --- Initialize Audio Processor with Wav2Vec ---
+        audio_conf = AudioConfig() # Define your audio config parameters here
+        processor = AudioProcessor(audio_conf, wav2vec_model_name=args.wav2vec_model_name)
 
-    # --- Initialize Audio Processor with Wav2Vec ---
-    audio_conf = AudioConfig() # Define your audio config parameters here
-    processor = AudioProcessor(audio_conf, wav2vec_model_name=args.wav2vec_model_name)
+        # --- Load and Split Metadata ---
+        logger.info("--- Loading and Splitting Metadata ---")
+        full_metadata_df = pd.read_csv(args.metadata_path)
+        if full_metadata_df.empty:
+            logger.error(f"Metadata CSV file at {args.metadata_path} is empty. Exiting.")
+            return
 
-    # --- Load and Split Metadata ---
-    logger.info("--- Loading and Splitting Metadata ---")
-    full_metadata_df = pd.read_csv(args.metadata_path)
-    if full_metadata_df.empty:
-        logger.error(f"Metadata CSV file at {args.metadata_path} is empty. Exiting.")
-        return
+        # Ensure 'label' column exists and is valid
+        if 'label' not in full_metadata_df.columns:
+            logger.error("Metadata CSV must contain a 'label' column ('bona-fide' or 'spoof'). Exiting.")
+            return
+        if not all(label in ['bona-fide', 'spoof'] for label in full_metadata_df['label'].unique()):
+            logger.error("The 'label' column must only contain 'bona-fide' or 'spoof' values. Exiting.")
+            return
+        train_metadata_df = full_metadata_df[full_metadata_df['speaker'].isin(train_speaker)].reset_index(drop=True)
+        test_metadata_df = full_metadata_df[full_metadata_df['speaker'].isin(test_speaker)].reset_index(drop=True)
 
-    # Ensure 'label' column exists and is valid
-    if 'label' not in full_metadata_df.columns:
-        logger.error("Metadata CSV must contain a 'label' column ('bona-fide' or 'spoof'). Exiting.")
-        return
-    if not all(label in ['bona-fide', 'spoof'] for label in full_metadata_df['label'].unique()):
-        logger.error("The 'label' column must only contain 'bona-fide' or 'spoof' values. Exiting.")
-        return
-    train_metadata_df = full_metadata_df[full_metadata_df['speaker'].isin(train_speaker)].reset_index(drop=True)
-    test_metadata_df = full_metadata_df[full_metadata_df['speaker'].isin(test_speaker)].reset_index(drop=True)
-        
-    # --- Create Datasets and DataLoaders ---
-    logger.info("--- Creating Datasets and DataLoaders ---")
-    train_dataset = DeepfakeDataset(args.data_dir, train_metadata_df, processor, augment=True)
-    test_dataset = DeepfakeDataset(args.data_dir, test_metadata_df, processor, augment=False) if not test_metadata_df.empty else None
+        # --- Create Datasets and DataLoaders ---
+        logger.info("--- Creating Datasets and DataLoaders ---")
+        train_dataset = DeepfakeDataset(args.data_dir, train_metadata_df, processor, augment=True)
+        test_dataset = DeepfakeDataset(args.data_dir, test_metadata_df, processor, augment=False) if not test_metadata_df.empty else None
 
-    if len(train_dataset) == 0:
-        logger.error("Training dataset is empty. Exiting.")
-        return
+        if len(train_dataset) == 0:
+            logger.error("Training dataset is empty. Exiting.")
+            return
 
-    train_loader = torch.utils.data.DataLoader(
-        train_dataset, batch_size=args.batch_size, shuffle=True,
-        num_workers=args.num_workers, pin_memory=True, collate_fn=collate_fn_skip_none
-    )
-    test_loader = torch.utils.data.DataLoader(
-        test_dataset, batch_size=args.batch_size, shuffle=False,
-        num_workers=args.num_workers, pin_memory=True, collate_fn=collate_fn_skip_none
-    ) if test_dataset else None
+        train_loader = torch.utils.data.DataLoader(
+            train_dataset, batch_size=args.batch_size, shuffle=True,
+            num_workers=args.num_workers, pin_memory=True, collate_fn=collate_fn_skip_none
+        )
+        test_loader = torch.utils.data.DataLoader(
+            test_dataset, batch_size=args.batch_size, shuffle=False,
+            num_workers=args.num_workers, pin_memory=True, collate_fn=collate_fn_skip_none
+        ) if test_dataset else None
+    elif match == 1:
+        train_loader, test_loader = train_On_ASVspoof2021(asv_balanced, args.batch_size, args.num_workers)
 
     # --- Initialize the Collaborative Model ---
     logger.info("--- Initializing Multi-View Collaborative Network ---")
@@ -756,7 +753,7 @@ def main():
 
     # --- Start Training ---
     logger.info("--- Starting Training ---")
-    save_path = "best_collaborative_model.pth"
+    save_path = "best_collaborative_model2.pth"
     
     # Use the new training function
     train_collaborative(

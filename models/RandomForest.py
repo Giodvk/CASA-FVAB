@@ -1,10 +1,12 @@
 import os
+
+import joblib
 import numpy as np
 import pandas as pd
 import librosa.feature
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import StandardScaler
-from split_dataset import train_speaker, test_speaker
+from split_dataset import train_speaker, test_speaker, asv_balanced
 from sklearn.model_selection import GridSearchCV, train_test_split
 from sklearn.metrics import accuracy_score, recall_score, roc_auc_score, classification_report
 
@@ -45,12 +47,10 @@ def prepare_data_wild(speakers: np.ndarray, path: str, csv_path: str) -> pd.Data
 
     return pd.DataFrame(data)
 
-def prepare_data_asv(path: str, csv_path: str) -> pd.DataFrame:
-    df = pd.read_csv(os.path.join(csv_path, "ASVSpoofData.csv"))
+def prepare_data_asv(asv_data) -> pd.DataFrame:
     data = []
-
-    for _, row in df.iterrows():
-        file_path = os.path.join(path, row['file'])
+    for _, row in asv_data.iterrows():
+        file_path = os.path.join(row['file'])
         audio, sr = librosa.load(file_path)
         features = extract_features(audio, sr)
         features.update({'label': row['label']})
@@ -83,6 +83,9 @@ def train_and_evaluate(train_df: pd.DataFrame, test_df: pd.DataFrame):
     y_pred = best_clf.predict(X_test_scaled)
     y_prob = best_clf.predict_proba(X_test_scaled)[:, 1] if hasattr(clf, "predict_proba") else None
 
+    joblib.dump(best_clf, "../saved_models/Random_Forest.pkl")
+    joblib.dump(scaler, "../saved_models/RFscaler.pkl")
+
     # Metriche
     print("Performance metrics:")
     print(f"Accuracy      : {accuracy_score(y_test, y_pred):.4f}")
@@ -99,17 +102,17 @@ if __name__ == "__main__":
 
     choice = int(input())
 
-    print("Inserire il path dei metadati: ")
-
-    source, csv = input().split(" ")
-
     match choice:
         case 0:
+            print("Inserire il path dei metadati: ")
+
+            source, csv = input().split(" ")
+
             train_df = prepare_data_wild(train_speaker, source, csv)
             test_df = prepare_data_wild(test_speaker, source, csv)
             train_and_evaluate(train_df, test_df)
         case 1:
-            df = prepare_data_asv(source, csv)
+            df = prepare_data_asv(asv_balanced)
             train_df, test_df = train_test_split(df, test_size=0.25, random_state=42)
             train_and_evaluate(train_df, test_df)
 

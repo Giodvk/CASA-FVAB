@@ -8,7 +8,6 @@ import numpy as np
 import pandas as pd
 import librosa
 import torch
-from sklearn.model_selection import train_test_split
 from sklearn.cluster import KMeans
 
 DIR_PATH = 'C:/Users/dmc/PycharmProjects/CASA-FVAB/processed_audio/'

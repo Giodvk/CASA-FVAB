@@ -5,6 +5,8 @@ import numpy as np
 import pandas as pd
 import torch
 import librosa
+from scipy.interpolate import interp1d
+from scipy.optimize import brentq
 from sklearn.metrics import accuracy_score, classification_report, roc_auc_score, roc_curve
 import joblib
 from tqdm import tqdm
@@ -138,11 +140,13 @@ def evaluate_model(name, y_true, y_prob, threshold):
     y_pred = (y_prob > threshold).astype(int)
     accuracy = accuracy_score(y_true, y_pred)
     roc_auc = roc_auc_score(y_true, y_prob)
-    
+    fpr, tpr, _ = roc_curve(y_true, y_pred)
+    eer = brentq(lambda x: 1. - x - interp1d(fpr, tpr)(x), 0., 1.)
     print(f"\n----- {name} -----")
     print(f"Using Threshold: {threshold:.4f}")
     print(f"Accuracy: {accuracy:.4f}")
     print(f"ROC AUC:  {roc_auc:.4f}")
+    print(f"EER rate: {eer}")
     print("Classification Report:")
     print(classification_report(y_true, y_pred, digits=4, zero_division=0))
     print("--------------------" + "-"*len(name))

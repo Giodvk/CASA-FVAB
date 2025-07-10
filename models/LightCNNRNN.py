@@ -3,13 +3,12 @@ import torch
 import torch.nn as nn
 import pandas as pd
 from torch import optim
-
-import ASVSpoofDataset
 from DeepLearningModel import DeepfakeDataset, AudioProcessor, AudioConfig
 from ASVSpoofDataset import ASVspoofDataset, ASVSpoofProcessor
-from split_dataset import train_speaker, test_speaker
+from split_dataset import train_speaker, test_speaker, asv_balanced
 from light_cnn import network_29layers_v2, resblock
 from sklearn.model_selection import train_test_split
+from IntermediateCrossFusion import collate_fn_skip_none
 
 
 class ModifiedLightCNN(network_29layers_v2):
@@ -84,9 +83,9 @@ def train(model, train_loader, criterion, device, optimizer):
     model.train()
     total_loss, total_correct, total_samples = 0.0, 0, 0
     for x, y in train_loader:
-        mel_spectrograms = x.to(device)
+        mel_spectrograms = x['mel'].to(device)
         labels = y.to(device)
-        output = model(mel_spectrograms)
+        output = model(mel_spectrograms).to(device)
         loss = criterion(output, labels)
 
         optimizer.zero_grad()
@@ -106,10 +105,9 @@ def validate(model, valid_loader, criterion, device):
 
     with torch.no_grad():
         for x, y in valid_loader:
-            mel_spectrograms = x.to(device)
+            mel_spectrograms = x['mel'].to(device)
             labels = y.to(device)
-            mel_spectrograms = mel_spectrograms.unsqueeze(1)
-            output = model(mel_spectrograms)
+            output = model(mel_spectrograms).to(device)
             loss = criterion(output, labels)
 
             total_loss += loss.item() * len(labels)
@@ -119,10 +117,10 @@ def validate(model, valid_loader, criterion, device):
     return total_loss / total_samples, total_correct / total_samples
 
 
-def prepare_loader_In_The_Wild(source_path: str, samples: pd.DataFrame, train_speakers: pd.DataFrame, valid_speakers: pd.DataFrame,
-                   batch_size: int = 64):
+def prepare_loader_In_The_Wild(source_path: str, samples: pd.DataFrame,
+                               train_speakers: pd.DataFrame, valid_speakers: pd.DataFrame, batch_size: int = 64):
     config = AudioConfig()
-    processor = AudioProcessor(config)
+    processor = AudioProcessor(config, "C:\\Users\dmc\PycharmProjects\CASA-FVAB\wav2vec2-xlsr")
 
     train_speakers = samples[samples['speaker'].isin(train_speakers)].reset_index(drop=True)
     valid_speakers = samples[samples['speaker'].isin(valid_speakers)].reset_index(drop=True)
@@ -131,53 +129,59 @@ def prepare_loader_In_The_Wild(source_path: str, samples: pd.DataFrame, train_sp
     train_dataset = DeepfakeDataset(Path(source_path), train_speakers, processor)
     valid_dataset = DeepfakeDataset(Path(source_path), valid_speakers, processor)
 
-    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    valid_loader = torch.utils.data.DataLoader(valid_dataset, batch_size=batch_size, shuffle=False)
+    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
+                                               collate_fn=collate_fn_skip_none)
+    valid_loader = torch.utils.data.DataLoader(valid_dataset, batch_size=batch_size, shuffle=False,
+                                               collate_fn=collate_fn_skip_none)
 
     return train_loader, valid_loader, weights
 
-def prepare_loader_ASV(source_path: str, train_dataset: ASVSpoofDataset, valid_dataset: ASVSpoofDataset,
-                       batch_size: int =64):
+
+def prepare_loader_ASV(train_dataset, valid_dataset, batch_size: int =64):
     config = AudioConfig()
-    processor = ASVSpoofProcessor(config)
+    processor = ASVSpoofProcessor(config, wav2vec_model_name="C:\\Users\dmc\PycharmProjects\CASA-FVAB\wav2vec2-xlsr")
 
-    asv_train = ASVspoofDataset(source_path, train_dataset, 5, processor, mode='train')
-    asv_valid = ASVspoofDataset(source_path, valid_dataset, 5, processor, mode='eval')
+    weights = compute_loss_weight(train_dataset)
 
-    train_loader = torch.utils.data.DataLoader(asv_train, batch_size=batch_size, shuffle=True)
-    valid_loader = torch.utils.data.DataLoader(asv_valid, batch_size=batch_size, shuffle=False)
+    asv_train = ASVspoofDataset("", train_dataset, 5, processor, mode='train')
+    asv_valid = ASVspoofDataset("", valid_dataset, 5, processor, mode='eval')
 
-    return train_loader, valid_loader
+    train_loader = torch.utils.data.DataLoader(asv_train, batch_size=batch_size,
+                                               shuffle=True, collate_fn=collate_fn_skip_none)
+    valid_loader = torch.utils.data.DataLoader(asv_valid, batch_size=batch_size,
+                                               shuffle=False, collate_fn=collate_fn_skip_none)
+
+    return train_loader, valid_loader, weights
 
 def main():
     print("Decidere Dataset d'allenamento: 0 (In_The_Wild), 1 (ASVspoof2021)")
 
     choice = int(input())
 
-    print("Inserire il path dei file sorgenti e dei metadati: ")
-    source_path, df_path = input().split(" ")
-
-    df = pd.read_csv(df_path)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     model = LightCNNRNN().to(device)
     torch.compile(model)
-    optimizer = optim.Adam(model.parameters(), lr=1e-4)
-
+    optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4)
+    pos_weight = None
     match choice:
         case 0:
+            print("Inserire il path dei file sorgenti e dei metadati: ")
+            source_path, df_path = input().split(" ")
+            df = pd.read_csv(df_path)
+
             train_loader, valid_loader, pos_weight = prepare_loader_In_The_Wild(source_path, df, train_speaker,
-                                                                                valid_speakers=test_speaker, batch_size=64)
+                                                                                valid_speakers=test_speaker, batch_size=32)
         case 1:
-            train_dataset, valid_dataset = train_test_split(df[:152955], test_size=0.25, random_state=42)
-            train_loader, valid_loader = prepare_loader_ASV(source_path, train_dataset, valid_dataset, batch_size=64)
+            train_dataset, valid_dataset = train_test_split(asv_balanced, test_size=0.25, random_state=42)
+            train_loader, valid_loader, pos_weight = prepare_loader_ASV(train_dataset, valid_dataset, batch_size=32)
         case _:
             train_loader, valid_loader = None, None
-    loss_fn = nn.CrossEntropyLoss()
+    loss_fn = nn.CrossEntropyLoss(pos_weight).to(device)
 
     # Early stopping setup
     best_val_loss = float('inf')
-    patience = 30
+    patience = 10
     patience_counter = 0
     best_epoch = -1
 
@@ -199,7 +203,7 @@ def main():
             best_val_loss = val_loss
             patience_counter = 0
             best_epoch = epoch
-            torch.save(model.state_dict(), "best_model.pth")
+            torch.save(model.state_dict(), "../saved_models/lighcnn.pth")
             print("Saved best model")
         else:
             patience_counter += 1
